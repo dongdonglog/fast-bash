@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0

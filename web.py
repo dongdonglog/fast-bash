@@ -16,7 +16,7 @@ SMON = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.pat
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 REFRESH = 5  # 后台采样刷新间隔（秒）
 
-CACHE = {"json": b"{}", "at": 0}
+CACHE = {"json": b'{"status":"sampling"}', "at": 0}
 CACHE_LOCK = threading.Lock()
 
 HTML = r"""<!DOCTYPE html>
@@ -87,42 +87,55 @@ const lvl=p=>p>=90?['high','high']:p>=60?['mid','mid']:['low','low'];
 function card(t,v,s,cls,bar){return `<div class="card"><div class="t">${t}</div><div class="v ${cls||''}">${v}</div><div class="s">${s||''}</div>${bar?`<div class="bar"><i style="width:${Math.min(100,bar)}%"></i></div>`:''}</div>`;}
 
 function render(){
-  if(!data) return;
-  const c=data.cpu, m=data.memory;
-  const cpuCls=(c.percent>=90?'high':c.percent>=60?'mid':'low');
-  const memCls=(m.percent>=90?'high':m.percent>=60?'mid':'low');
-  document.getElementById('meta').textContent =
-    `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}`;
-  document.getElementById('cards').innerHTML =
-    card('CPU 使用率', c.percent+'%', `负载 ${c.load1}`, cpuCls, c.percent) +
-    card('内存', `${(m.used_mb/1024).toFixed(1)}G / ${(m.total_mb/1024).toFixed(1)}G`, `${m.percent}% 已用`, memCls, m.percent) +
-    card('根分区 /', data.disk_root_percent+'%', '已用空间', lvl(data.disk_root_percent)[0], data.disk_root_percent) +
-    card('进程数', data.processes.length, '采样进程总数');
-
-  const aEl=document.getElementById('alerts');
-  if(data.alerts&&data.alerts.length){
-    aEl.innerHTML='<div class="a" style="background:none;border:none;color:var(--mut);padding:0 0 6px">⚠ 诊断建议</div>'+
-      data.alerts.map(a=>`<div class="a">${a}</div>`).join('');
-  } else {
-    aEl.innerHTML='<div class="ok">✓ 系统各项指标正常</div>';
+  // 数据未就绪或异常时：显示"正在采样"，绝不卡在"加载中"
+  if(!data || !data.cpu || !data.memory || !Array.isArray(data.processes)){
+    document.getElementById('meta').textContent =
+      (data && data.error) ? ('采集失败：'+data.error) : '正在采样，请稍候…（首次约需 5~10 秒）';
+    document.getElementById('cards').innerHTML='';
+    document.getElementById('alerts').innerHTML='<div class="ok">正在采样…</div>';
+    document.getElementById('rows').innerHTML='';
+    document.getElementById('foot').textContent='';
+    return;
   }
+  try{
+    const c=data.cpu, m=data.memory;
+    const cpuCls=(c.percent>=90?'high':c.percent>=60?'mid':'low');
+    const memCls=(m.percent>=90?'high':m.percent>=60?'mid':'low');
+    document.getElementById('meta').textContent =
+      `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}`;
+    document.getElementById('cards').innerHTML =
+      card('CPU 使用率', c.percent+'%', `负载 ${c.load1}`, cpuCls, c.percent) +
+      card('内存', `${(m.used_mb/1024).toFixed(1)}G / ${(m.total_mb/1024).toFixed(1)}G`, `${m.percent}% 已用`, memCls, m.percent) +
+      card('根分区 /', data.disk_root_percent+'%', '已用空间', lvl(data.disk_root_percent)[0], data.disk_root_percent) +
+      card('进程数', data.processes.length, '采样进程总数');
 
-  const rows=data.processes.slice();
-  rows.sort((x,y)=>(sortDesc?-1:1)*((x[sortKey]??-1)-(y[sortKey]??-1)));
-  document.getElementById('rows').innerHTML=rows.slice(0,200).map(p=>{
-    const cc=lvl(p.cpu), mc=lvl(p.rss_mb/1024/(data.memory.total_mb/1024)*100);
-    const nlvl = p.net>=500?'high':p.net>=200?'mid':'low';
-    return `<tr>
-      <td>${p.pid}</td>
-      <td class="${cc[1]}">${p.cpu}%</td>
-      <td class="${mc[1]}">${(p.rss_mb/1024).toFixed(1)}G</td>
-      <td>${fmtB(p.read_kbs)}/s</td><td>${fmtB(p.write_kbs)}/s</td>
-      <td class="${nlvl}">${p.net}</td>
-      <td>${fmtB(p.recv_kbs||0)}/s</td><td>${fmtB(p.sent_kbs||0)}/s</td>
-      <td>${p.user}</td><td class="cmd" title="${p.cmd}">${p.cmd}</td>
-    </tr>`;
-  }).join('');
-  document.getElementById('foot').textContent='最后更新 '+new Date().toLocaleTimeString()+' · 每 3 秒自动刷新 · 点击表头排序';
+    const aEl=document.getElementById('alerts');
+    if(data.alerts&&data.alerts.length){
+      aEl.innerHTML='<div class="a" style="background:none;border:none;color:var(--mut);padding:0 0 6px">⚠ 诊断建议</div>'+
+        data.alerts.map(a=>`<div class="a">${a}</div>`).join('');
+    } else {
+      aEl.innerHTML='<div class="ok">✓ 系统各项指标正常</div>';
+    }
+
+    const rows=data.processes.slice();
+    rows.sort((x,y)=>(sortDesc?-1:1)*((x[sortKey]??-1)-(y[sortKey]??-1)));
+    document.getElementById('rows').innerHTML=rows.slice(0,200).map(p=>{
+      const cc=lvl(p.cpu), mc=lvl(p.rss_mb/1024/(data.memory.total_mb/1024)*100);
+      const nlvl = p.net>=500?'high':p.net>=200?'mid':'low';
+      return `<tr>
+        <td>${p.pid}</td>
+        <td class="${cc[1]}">${p.cpu}%</td>
+        <td class="${mc[1]}">${(p.rss_mb/1024).toFixed(1)}G</td>
+        <td>${fmtB(p.read_kbs)}/s</td><td>${fmtB(p.write_kbs)}/s</td>
+        <td class="${nlvl}">${p.net}</td>
+        <td>${fmtB(p.recv_kbs||0)}/s</td><td>${fmtB(p.sent_kbs||0)}/s</td>
+        <td>${p.user}</td><td class="cmd" title="${p.cmd}">${p.cmd}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('foot').textContent='最后更新 '+new Date().toLocaleTimeString()+' · 每 5 秒自动刷新 · 点击表头排序';
+  }catch(e){
+    document.getElementById('meta').textContent='数据渲染异常：'+e.message;
+  }
 }
 
 document.querySelectorAll('th').forEach(th=>th.onclick=()=>{
@@ -155,10 +168,13 @@ def collect():
 
 def sampler():
     while True:
-        body = collect()
-        with CACHE_LOCK:
-            CACHE["json"] = body
-            CACHE["at"] = time.time()
+        try:
+            body = collect()
+            with CACHE_LOCK:
+                CACHE["json"] = body
+                CACHE["at"] = time.time()
+        except Exception:
+            pass  # 采样失败不影响服务，保持上次缓存
         time.sleep(REFRESH)
 
 
