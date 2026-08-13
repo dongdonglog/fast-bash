@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 INTERVAL=2
 SORT_KEY=cpu
 JSON_MODE=0
@@ -83,7 +83,7 @@ load_sys_stats() {
     CPU_SYS=0
     if (( (pt-raw) > 0 )); then CPU_SYS=$(( (pt-raw-(pide-id1)) * 100 / (pt-raw) )); fi
     MEM_TOTAL=$(awk '/MemTotal:/{print $2}' /proc/meminfo)
-    MEM_USED=$(awk '/MemAvailable:/{m=$2} END{print (mt-m)/1024}' mt="$MEM_TOTAL" /proc/meminfo)
+    MEM_USED=$(awk '/MemAvailable:/{m=$2} END{print int((mt-m)/1024)}' mt="$MEM_TOTAL" /proc/meminfo)
     MEM_TOTAL=$(( MEM_TOTAL / 1024 ))
     read -r L1 L5 L15 _ < <(cat /proc/loadavg 2>/dev/null || echo "0 0 0")
     DISK_USE=$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
@@ -174,6 +174,7 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
     local name
     name=$(pid_cmdline "$pid"); name=${name:0:50}
     [[ -z $name ]] && name="${u1:0:50}"
+    [[ -z $name ]] && name="<内核线程>"
     if (( NET_BW )); then
       local rv=0 sv=0 bw
       bw=$(grep -m1 "^$pid " <<<"$nbw")
@@ -203,17 +204,20 @@ collect() {
 
 # ------------------------- 显示辅助 -------------------------
 hr_size() {
-  awk -v b="$1" 'BEGIN{ b=b<0?0:b; split("B K M G T",u); i=1; while(b>=1024&&i<5){b/=1024;i++} printf "%.1f%s",b,u[i] }'
+  awk -v b="${1:-0}" 'BEGIN{ b=b<0?0:b; split("B K M G T",u); i=1; while(b>=1024&&i<5){b/=1024;i++} printf "%.1f%s",b,u[i] }'
 }
 
 color_pct() {  # 百分比 红≥90 黄≥60 绿
-  if (( $1 >= 90 )); then echo "$C_RED$C_BLD"; elif (( $1 >= 60 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
+  local v=${1:-0}
+  if (( v >= 90 )); then echo "$C_RED$C_BLD"; elif (( v >= 60 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
 }
 color_io() {   # 磁盘速率 KB/s 红≥51200 黄≥10240
-  if (( $1 >= 51200 )); then echo "$C_RED$C_BLD"; elif (( $1 >= 10240 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
+  local v=${1:-0}
+  if (( v >= 51200 )); then echo "$C_RED$C_BLD"; elif (( v >= 10240 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
 }
 color_conn() { # 连接数 红≥500 黄≥200
-  if (( $1 >= 500 )); then echo "$C_RED$C_BLD"; elif (( $1 >= 200 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
+  local v=${1:-0}
+  if (( v >= 500 )); then echo "$C_RED$C_BLD"; elif (( v >= 200 )); then echo "$C_YEL"; else echo "$C_GRN"; fi
 }
 
 float_gt() {  # 浮点比较: $1 > $2
@@ -241,7 +245,7 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出诊断建议到 ALERT
   ALERTS=()
   local a topio_pid=0 topio_rk=0 topnet_pid=0 topnet_nc=0 pid rk nc rv sv nb
   while IFS=' ' read -r -a a; do
-    pid=${a[0]}; rk=${a[3]}; nc=${a[5]}; rv=${a[7]:-0}; sv=${a[8]:-0}
+    pid=${a[0]:-0}; rk=${a[3]:-0}; nc=${a[5]:-0}; rv=${a[7]:-0}; sv=${a[8]:-0}
     (( rk > topio_rk )) && { topio_rk=$rk; topio_pid=$pid; }
     if (( NET_BW )); then nb=$(( rv + sv )); else nb=$nc; fi
     (( nb > topnet_nc )) && { topnet_nc=$nb; topnet_pid=$pid; }
@@ -284,8 +288,8 @@ print_table() {  # 从 stdin 读 collect 数据（已排序）
   local a lines=0 pid cpu rss rk wk nc u nm rv sv mem_pct
   while IFS=' ' read -r -a a; do
     (( lines++ )); (( lines > 20 )) && break
-    pid=${a[0]}; cpu=${a[1]}; rss=${a[2]}; rk=${a[3]}; wk=${a[4]}; nc=${a[5]}; u=${a[6]}
-    if (( NET_BW )); then rv=${a[7]}; sv=${a[8]}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    pid=${a[0]:-0}; cpu=${a[1]:-0}; rss=${a[2]:-0}; rk=${a[3]:-0}; wk=${a[4]:-0}; nc=${a[5]:-0}; u=${a[6]:-}
+    if (( NET_BW )); then rv=${a[7]:-0}; sv=${a[8]:-0}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
     mem_pct=$(( rss * 100 / (( MEM_TOTAL?MEM_TOTAL:1) * 1024) ))
     local pc mc ic ncc
     pc=$(color_pct "$cpu")
@@ -339,8 +343,8 @@ emit_json() {  # 从 stdin 读 collect 数据
   echo "  \"processes\": ["
   local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
   while IFS=' ' read -r -a a; do
-    pid=${a[0]}; cpu=${a[1]}; rss=${a[2]}; rk=${a[3]}; wk=${a[4]}; nc=${a[5]}; u=${a[6]}
-    if (( NET_BW )); then rv=${a[7]}; sv=${a[8]}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    pid=${a[0]:-0}; cpu=${a[1]:-0}; rss=${a[2]:-0}; rk=${a[3]:-0}; wk=${a[4]:-0}; nc=${a[5]:-0}; u=${a[6]:-}
+    if (( NET_BW )); then rv=${a[7]:-0}; sv=${a[8]:-0}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
     u2=${u//\\/\\\\}; u2=${u2//\"/\\\"}
     nm2=${nm//\\/\\\\}; nm2=${nm2//\"/\\\"}
     (( first )) || echo ","
