@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 INTERVAL=2
 SORT_KEY=cpu
 JSON_MODE=0
@@ -115,37 +115,71 @@ cpu_total() {  # 输出 "total idle"
   echo "$(( $2 + $3 + $4 + idle + iowait + $7 + $8 + $9 )) $(( idle + iowait ))"
 }
 
-pid_ticks() {  # 输出 "utime stime"
+# 快速读取器：全部用 bash 内建（无外部子进程），结果写入全局变量
+T_TICKS1=0; T_TICKS2=0
+read_ticks() {  # $1=pid -> $T_TICKS1 $T_TICKS2
   local pid=$1 s
-  s=$(<"/proc/$pid/stat")
-  [[ -z $s ]] && { echo "0 0"; return; }
+  T_TICKS1=0; T_TICKS2=0
+  [[ -r "/proc/$pid/stat" ]] || return 0
+  IFS= read -r s <"/proc/$pid/stat"
   s=${s##*) }
   # shellcheck disable=SC2086
   set -- $s
-  echo "${12} ${13}"
+  T_TICKS1=${12:-0}; T_TICKS2=${13:-0}
 }
 
-pid_rss() { local pid=$1; awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null; }
-pid_io()  { local pid=$1; awk '/^read_bytes/{r=$2} /^write_bytes/{w=$2} END{print r+0, w+0}' "/proc/$pid/io" 2>/dev/null || echo "0 0"; }
+RSSKB=0
+read_rss() {  # $1=pid -> $RSSKB
+  local pid=$1 s
+  RSSKB=0
+  [[ -r "/proc/$pid/status" ]] || return 0
+  IFS= read -rd '' s <"/proc/$pid/status" || true
+  [[ $s == *VmRSS:* ]] || return 0
+  s=${s#*VmRSS:}; s=${s%%kB*}; RSSKB=${s//[!0-9]/}
+}
 
-pid_cmdline() {
-  local pid=$1
-  if [[ -r "/proc/$pid/cmdline" ]]; then
-    tr '\0' ' ' <"/proc/$pid/cmdline"
-  fi
+IO_R=0; IO_W=0
+read_io() {  # $1=pid -> $IO_R $IO_W
+  local pid=$1 s
+  IO_R=0; IO_W=0
+  [[ -r "/proc/$pid/io" ]] || return 0
+  IFS= read -rd '' s <"/proc/$pid/io" || true
+  [[ $s == *read_bytes:* ]] || return 0
+  s=${s#*read_bytes:}; IO_R=${s%%$'\n'*}; IO_R=${IO_R//[!0-9]/}
+  [[ $s == *write_bytes:* ]] || return 0
+  s=${s#*write_bytes:}; IO_W=${s%%$'\n'*}; IO_W=${IO_W//[!0-9]/}
+}
+
+CMDLINE=""
+read_cmdline() {  # $1=pid -> $CMDLINE
+  local pid=$1 s
+  CMDLINE=""
+  [[ -r "/proc/$pid/cmdline" ]] || return 0
+  IFS= read -rd '' s <"/proc/$pid/cmdline" || true
+  CMDLINE=${s//$'\0'/ }
+}
+
+NUMOUT=0
+num() {  # 强制转为数字（防字段错位），结果写入 $NUMOUT（无子进程）
+  local v=${1:-0}
+  [[ $v =~ ^-?[0-9]+$ ]] && NUMOUT=$v || NUMOUT=0
 }
 
 linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes user"
-  local pid u s r i
+  local pid u upid uu
   mkdir -p "$BASEDIR" 2>/dev/null || return 1
+  declare -A USERS
+  while read -r upid uu; do
+    [[ $upid =~ ^[0-9]+$ ]] && USERS[$upid]=$uu
+  done < <(ps -eo pid=,user=)
   for pdir in /proc/[0-9]*; do
     pid=${pdir##*/}
     [[ -r "/proc/$pid/stat" ]] || continue
-    u=$(ps -o user= -p "$pid" 2>/dev/null); u=${u:-?}
-    s=$(pid_ticks "$pid")
-    r=$(pid_rss "$pid")
-    i=$(pid_io "$pid")
-    printf '%s %s %s %s\n' "$s" "$r" "$i" "$u" >"$BASEDIR/$pid"
+    u=${USERS[$pid]:-?}
+    read_ticks "$pid"
+    read_rss "$pid"
+    read_io "$pid"
+    printf '%s %s %s %s\n' "$T_TICKS1 $T_TICKS2" "$RSSKB" "$IO_R $IO_W" "$u" >"$BASEDIR/$pid"
   done
 }
 
@@ -161,10 +195,12 @@ net_bw_read() {
 }
 
 linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
-  local ptot pide pid t2 t0c rss
+  local ptot pide pid rss np
   read -r ptot pide < <(cpu_total)
-  local netmap=""
-  netmap=$( { ss -tpnH 2>/dev/null; ss -unpH 2>/dev/null; } | grep -o 'pid=[0-9]*' )
+  declare -A NETCNT
+  while read -r np; do
+    [[ $np =~ ^pid=[0-9]+$ ]] && (( NETCNT[${np#pid=}]++ ))
+  done < <( { ss -tpnH 2>/dev/null; ss -unpH 2>/dev/null; } | grep -o 'pid=[0-9]*' )
   local nbw=""
   if (( NET_BW )); then nbw=$(net_bw_read); fi
   for pdir in /proc/[0-9]*; do
@@ -172,17 +208,19 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
     [[ -r "/proc/$pid/stat" && -f "$BASEDIR/$pid" ]] || continue
     local t1 t0 _ rb0 wb0 u1
     read -r t1 t0 _ rb0 wb0 u1 <"$BASEDIR/$pid"
-    read -r t2 t0c < <(pid_ticks "$pid")
-    local cpu=0 rk=0 wk=0 nc=0 ri wi
-    local dp=$(( (t2 + t0c) - (t1 + t0) ))
+    num "$t1"; t1=$NUMOUT; num "$t0"; t0=$NUMOUT
+    num "$rb0"; rb0=$NUMOUT; num "$wb0"; wb0=$NUMOUT
+    read_ticks "$pid"
+    local cpu=0 rk=0 wk=0 nc=0
+    local dp=$(( (T_TICKS1 + T_TICKS2) - (t1 + t0) ))
     if (( ptot > 0 && dp > 0 )); then cpu=$(( dp * NCPU * 100 / ptot )); fi
-    rss=$(pid_rss "$pid")
-    read -r ri wi < <(pid_io "$pid")
-    rk=$(( (ri - rb0) / INTERVAL / 1024 )); [[ $rk -lt 0 ]] && rk=0
-    wk=$(( (wi - wb0) / INTERVAL / 1024 )); [[ $wk -lt 0 ]] && wk=0
-    nc=$(grep -c "pid=$pid" <<<"$netmap")
+    read_rss "$pid"; rss=$RSSKB
+    read_io "$pid"
+    rk=$(( (IO_R - rb0) / INTERVAL / 1024 )); [[ $rk -lt 0 ]] && rk=0
+    wk=$(( (IO_W - wb0) / INTERVAL / 1024 )); [[ $wk -lt 0 ]] && wk=0
+    nc=${NETCNT[$pid]:-0}
     local name
-    name=$(pid_cmdline "$pid"); name=${name:0:50}
+    read_cmdline "$pid"; name=$CMDLINE; name=${name:0:50}
     [[ -z $name ]] && name="${u1:0:50}"
     [[ -z $name ]] && name="<内核线程>"
     if (( NET_BW )); then
@@ -193,6 +231,7 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
         set -- $bw
         rv=${2:-0}; sv=${3:-0}
         rv=${rv%.*}; sv=${sv%.*}
+        num "$rv"; rv=$NUMOUT; num "$sv"; sv=$NUMOUT
       fi
       printf '%s %s %s %s %s %s %s %s %s %s\n' "$pid" "$cpu" "$rss" "$rk" "$wk" "$nc" "$u1" "$rv" "$sv" "$name"
     else
@@ -255,7 +294,7 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出诊断建议到 ALERT
   ALERTS=()
   local a topio_pid=0 topio_rk=0 topnet_pid=0 topnet_nc=0 pid rk nc rv sv nb
   while IFS=' ' read -r -a a; do
-    pid=${a[0]:-0}; rk=${a[3]:-0}; nc=${a[5]:-0}; rv=${a[7]:-0}; sv=${a[8]:-0}
+    num "${a[0]}"; pid=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT
     (( rk > topio_rk )) && { topio_rk=$rk; topio_pid=$pid; }
     if (( NET_BW )); then nb=$(( rv + sv )); else nb=$nc; fi
     (( nb > topnet_nc )) && { topnet_nc=$nb; topnet_pid=$pid; }
@@ -298,8 +337,8 @@ print_table() {  # 从 stdin 读 collect 数据（已排序）
   local a lines=0 pid cpu rss rk wk nc u nm rv sv mem_pct
   while IFS=' ' read -r -a a; do
     (( lines++ )); (( lines > 20 )) && break
-    pid=${a[0]:-0}; cpu=${a[1]:-0}; rss=${a[2]:-0}; rk=${a[3]:-0}; wk=${a[4]:-0}; nc=${a[5]:-0}; u=${a[6]:-}
-    if (( NET_BW )); then rv=${a[7]:-0}; sv=${a[8]:-0}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}
+    if (( NET_BW )); then num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
     mem_pct=$(( rss * 100 / (( MEM_TOTAL?MEM_TOTAL:1) * 1024) ))
     local pc mc ic ncc
     pc=$(color_pct "$cpu")
@@ -353,8 +392,8 @@ emit_json() {  # 从 stdin 读 collect 数据
   echo "  \"processes\": ["
   local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
   while IFS=' ' read -r -a a; do
-    pid=${a[0]:-0}; cpu=${a[1]:-0}; rss=${a[2]:-0}; rk=${a[3]:-0}; wk=${a[4]:-0}; nc=${a[5]:-0}; u=${a[6]:-}
-    if (( NET_BW )); then rv=${a[7]:-0}; sv=${a[8]:-0}; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}
+    if (( NET_BW )); then num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
     u2=${u//\\/\\\\}; u2=${u2//\"/\\\"}
     nm2=${nm//\\/\\\\}; nm2=${nm2//\"/\\\"}
     (( first )) || echo ","
