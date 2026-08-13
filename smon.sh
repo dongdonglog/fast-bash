@@ -5,8 +5,8 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.4"
-INTERVAL=2
+VERSION="0.2.5"
+INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
 NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)

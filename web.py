@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SMON = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "smon.sh")
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
-REFRESH = 3  # 后台采样刷新间隔（秒）
+REFRESH = 5  # 后台采样刷新间隔（秒）
 
 CACHE = {"json": b"{}", "at": 0}
 CACHE_LOCK = threading.Lock()
@@ -138,7 +138,7 @@ async function poll(){
   }catch(e){ data=null; }
   render();
 }
-poll(); setInterval(poll,3000);
+poll(); setInterval(poll,5000);
 </script>
 </body>
 </html>
