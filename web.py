@@ -42,6 +42,8 @@ HTML = r"""<!DOCTYPE html>
   .bar{height:6px;background:var(--panel2);border-radius:3px;margin-top:8px;overflow:hidden}
   .bar>i{display:block;height:100%;border-radius:3px;transition:width .4s}
   .low{color:var(--grn)} .mid{color:var(--yel)} .high{color:var(--red)}
+  .banner{display:none;background:#2a2415;border:1px solid #4a3c22;border-left:3px solid var(--yel);
+          color:var(--yel);padding:8px 12px;border-radius:6px;margin-bottom:12px;font-size:13px}
   .alerts{margin-bottom:16px}
   .alerts .a{background:#2a1d24;border:1px solid #4a2a33;border-left:3px solid var(--red);
              color:var(--red);padding:8px 12px;border-radius:6px;margin-bottom:6px;font-size:13px}
@@ -63,6 +65,8 @@ HTML = r"""<!DOCTYPE html>
 <body>
 <h1>🖥 服务器状态 · smon</h1>
 <div class="meta" id="meta">加载中…</div>
+
+<div class="banner" id="banner">⚠ 当前以非 root 运行：磁盘IO / 连接数 / 带宽 数据不可用。请以 root 启动：<b>sudo smon --serve</b></div>
 
 <div class="cards" id="cards"></div>
 
@@ -103,6 +107,8 @@ function render(){
     const c=data.cpu, m=data.memory;
     const cpuCls=(c.percent>=90?'high':c.percent>=60?'mid':'low');
     const memCls=(m.percent>=90?'high':m.percent>=60?'mid':'low');
+    document.getElementById('banner').style.display =
+      (data.privileged===0 || data.privileged===false) ? 'block' : 'none';
     document.getElementById('meta').textContent =
       `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}`;
     document.getElementById('cards').innerHTML =

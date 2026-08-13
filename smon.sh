@@ -5,11 +5,12 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.7"
+VERSION="0.2.8"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
 NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+PRIVILEGED=0; [[ $EUID -eq 0 ]] && PRIVILEGED=1
 BASEDIR=$(mktemp -d "${TMPDIR:-/tmp}/smon.XXXXXX") || exit 1
 NETHOGS_PID=""
 NET_BW=0
@@ -287,6 +288,10 @@ print_summary() {
   printf '  CPU %s%3d%%%s   负载 %s/%s/%s   内存 %s%4d/%dMB%s   磁盘/ %s%3d%%%s\n' \
     "$cp" "$CPU_SYS" "$C_OFF" "$L1" "$L5" "$L15" \
     "$mp" "$MEM_USED" "$MEM_TOTAL" "$C_OFF" "$dp" "$DISK_USE" "$C_OFF"
+  if [[ $OS == linux && $PRIVILEGED == 0 ]]; then
+    printf '  %s⚠ 当前非 root：磁盘IO / 连接数 / 带宽 不可用，请用 %ssudo smon%s 查看完整数据%s\n' \
+      "$C_YEL" "$C_BLD" "$C_OFF" "$C_OFF"
+  fi
   echo
 }
 
@@ -391,6 +396,7 @@ emit_json() {  # 从 stdin 读 collect 数据
   echo "  \"cpu\": { \"percent\": $CPU_SYS, \"load1\": $L1, \"load5\": $L5, \"load15\": $L15 },"
   echo "  \"memory\": { \"total_mb\": $MEM_TOTAL, \"used_mb\": $MEM_USED, \"percent\": $mp },"
   printf '  "disk_root_percent": %d,\n' "$DISK_USE"
+  printf '  "privileged": %d,\n' "$PRIVILEGED"
   echo "  \"processes\": ["
   local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
   while IFS=' ' read -r -a a; do
