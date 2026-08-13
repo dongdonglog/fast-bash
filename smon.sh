@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.8"
+VERSION="0.2.9"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
@@ -14,6 +14,7 @@ PRIVILEGED=0; [[ $EUID -eq 0 ]] && PRIVILEGED=1
 BASEDIR=$(mktemp -d "${TMPDIR:-/tmp}/smon.XXXXXX") || exit 1
 NETHOGS_PID=""
 NET_BW=0
+NETIF=""
 
 # 颜色
 C_RED=$'\e[31m'; C_YEL=$'\e[33m'; C_GRN=$'\e[32m'; C_CYN=$'\e[36m'
@@ -191,8 +192,12 @@ net_bw_read() {
     /^Refreshing:/{next}
     {
       n=split($0,a,"/");
-      pid=a[n-2];
-      if (pid ~ /^[0-9]+$/ && pid != 0) print pid, a[n-1], a[n]
+      if (n < 3) next
+      pid=a[2];
+      if (pid ~ /^[0-9]+$/ && pid != 0) {
+        m=split(a[3],b,"\t");
+        if (m >= 3) print pid, b[3], b[2]
+      }
     }'
 }
 
@@ -397,6 +402,7 @@ emit_json() {  # 从 stdin 读 collect 数据
   echo "  \"memory\": { \"total_mb\": $MEM_TOTAL, \"used_mb\": $MEM_USED, \"percent\": $mp },"
   printf '  "disk_root_percent": %d,\n' "$DISK_USE"
   printf '  "privileged": %d,\n' "$PRIVILEGED"
+  printf '  "netif": "%s",\n' "$(json_escape "$NETIF")"
   echo "  \"processes\": ["
   local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
   while IFS=' ' read -r -a a; do
@@ -433,8 +439,16 @@ if [[ $OS == linux ]]; then SNAP=linux_snapshot; else SNAP=mac_snapshot; fi
 net_start() {
   NET_BW=0
   [[ $OS == linux && $EUID -eq 0 ]] || return 0
-  command -v nethogs >/dev/null || return 0
-  nethogs -t -d "$INTERVAL" >"$BASEDIR/net.log" 2>/dev/null &
+  command -v nethogs >/dev/null 2>&1 || return 0
+  NETIF=""
+  if [[ -n $SMON_NETIF ]]; then
+    NETIF=$SMON_NETIF   # 用户显式指定网卡（默认走自动探测）
+  else
+    NETIF=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}')
+    [[ -z $NETIF ]] && NETIF=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null)
+    [[ -z $NETIF ]] && NETIF=eth0
+  fi
+  nethogs -t -d "$INTERVAL" "$NETIF" >"$BASEDIR/net.log" 2>/dev/null &
   NETHOGS_PID=$!
   NET_BW=1
 }
@@ -476,7 +490,9 @@ fi
 
 if (( JSON_MODE )); then
   if [[ $OS == linux ]]; then
-    linux_snapshot; sleep "$INTERVAL"
+    net_start
+    linux_snapshot
+    if (( NET_BW )); then sleep $(( INTERVAL + 2 )); else sleep "$INTERVAL"; fi
   fi
   collect | emit_json
 else

@@ -16,7 +16,7 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 _SMON_CAND = [os.path.join(_DIR, "smon.sh"), os.path.join(_DIR, "smon")]
 SMON = sys.argv[1] if len(sys.argv) > 1 else next((p for p in _SMON_CAND if os.path.exists(p)), _SMON_CAND[0])
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
-REFRESH = 5  # 后台采样刷新间隔（秒）
+REFRESH = 2  # 后台采样间隔下限（秒）
 
 CACHE = {"json": b'{"status":"sampling"}', "at": 0}
 CACHE_LOCK = threading.Lock()
@@ -110,7 +110,8 @@ function render(){
     document.getElementById('banner').style.display =
       (data.privileged===0 || data.privileged===false) ? 'block' : 'none';
     document.getElementById('meta').textContent =
-      `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}`;
+      `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}` +
+      (data.netif ? ` · 网卡 ${data.netif}` : '');
     document.getElementById('cards').innerHTML =
       card('CPU 使用率', c.percent+'%', `负载 ${c.load1}`, cpuCls, c.percent) +
       card('内存', `${(m.used_mb/1024).toFixed(1)}G / ${(m.total_mb/1024).toFixed(1)}G`, `${m.percent}% 已用`, memCls, m.percent) +
