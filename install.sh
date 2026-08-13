@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# smon 一键安装脚本
+# 用法:  curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
+set -euo pipefail
+
+BASE_URL="${SMON_BASE_URL:-https://raw.githubusercontent.com/dongdonglog/fast-bash/main}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "需要 root 权限安装到 $INSTALL_DIR，请使用 sudo 运行：" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash" >&2
+  exit 1
+fi
+
+fetch() {  # $1=url $2=dest
+  if command -v curl >/dev/null; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null; then
+    wget -qO "$2" "$1"
+  else
+    echo "未找到 curl 或 wget" >&2
+    exit 1
+  fi
+}
+
+echo "[1/3] 下载 smon 与 web 面板 ..."
+fetch "$BASE_URL/smon.sh" "$INSTALL_DIR/smon"
+fetch "$BASE_URL/web.py" "$INSTALL_DIR/web.py"
+
+echo "[2/3] 设置可执行权限 ..."
+chmod +x "$INSTALL_DIR/smon"
+
+echo "[3/3] 验证 ..."
+if bash -n "$INSTALL_DIR/smon" && [[ -x "$INSTALL_DIR/smon" ]] && python3 -c "import ast; ast.parse(open('$INSTALL_DIR/web.py').read())" 2>/dev/null; then
+  echo
+  echo "✅ 安装成功！直接运行："
+  echo "   smon                    # 中文实时进程表"
+  echo "   smon -m / -d / -n       # 按内存 / 磁盘IO / 网络 排序"
+  echo "   smon -j                 # 输出 JSON"
+  echo "   smon --serve             # 启动 Web 面板 http://<ip>:8080/"
+  echo "   smon -h                 # 帮助"
+else
+  echo "❌ 安装失败，校验未通过" >&2
+  rm -f "$INSTALL_DIR/smon" "$INSTALL_DIR/web.py"
+  exit 1
+fi
