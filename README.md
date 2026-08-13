@@ -59,7 +59,7 @@ smon --serve 8080
 
 浏览器打开 `http://<服务器IP>:8080/` 即可看到中文仪表盘：
 
-- 顶部概况卡片：CPU / 内存 / 根分区 / 进程数（带进度条，超高标红）
+- 顶部概况卡片：CPU / 内存 / 根分区 / **网络总收总发** / 进程数（带进度条，超高标红）
 - 下方完整进程表：支持点击表头排序、红黄高亮
 - 底部诊断建议（同 CLI 的异常告警）
 - 后台每 5 秒自动采样一次，前端每 5 秒刷新
@@ -72,6 +72,7 @@ smon --serve 8080
  系统概况
   主机: web-01 | 系统: Linux | 运行: up 3 days, 2 hours
   CPU  32%   负载 1.2/0.8/0.6   内存  8400/16384MB   磁盘/ 3%
+  网络: ↓1.2MB/s  ↑0.3MB/s   (eth0)
 
 PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
 1234        45%   1.2G   8.4M   12M    12  2.1M 0.5M app      java -jar gateway.jar
@@ -86,7 +87,7 @@ PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
 - **进程主导**：下方全部是进程，按占用排序，一眼定位"谁在吃资源"。
 - **占用高亮**：占用 ≥90% 标红加粗、≥60% 标黄、正常绿色。
 - **诊断建议**：检测到 CPU/内存/负载/磁盘/IO/网络异常时，自动给出中文排查命令。
-- 顶部一行系统概况：CPU、负载、内存、根分区使用率。
+- 顶部一行系统概况：CPU、负载、内存、根分区使用率、**总收/总发流量**（接口级，始终可靠）。
 
 ## 数据来源与说明
 
@@ -96,7 +97,11 @@ PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
 | 内存 | `/proc/<pid>/status` 的 VmRSS | 精确物理内存占用 |
 | 磁盘 IO | `/proc/<pid>/io`（读写字节差值） | **需要 root** 才能读其他用户进程 |
 | 网络连接数 | `ss -p` 统计每进程 TCP/UDP 连接数 | 无需 root 即可统计 |
-| 网络带宽 | `nethogs -t`（root + 已安装时自动启用） | 显示每进程 收↓/发↑ KB/s，无则降级为连接数 |
+| 网络总流量 | `/proc/net/dev` 差值 | **始终可靠**，无需 root/nethogs，显示 总收/总发 |
+| 每进程带宽 | `nethogs -t`（root + 已安装时自动启用） | best-effort：虚拟网卡可能抓不到，此时总流量仍可见 |
+
+> **带宽三层**：① 总收/总发（接口级，永远可靠）② 每进程连接数（ss -p）③ 每进程带宽（nethogs，best-effort）。
+> 非 root 时②③不可用，但①总流量始终显示。nethogs 抓不到时页面会提示（可 `SMON_NETIF=<网卡> smon --serve` 指定网卡）。
 
 ### JSON 输出（`-j` / `--json`）
 
@@ -109,6 +114,10 @@ PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
   "cpu": { "percent": 32, "load1": 1.2, "load5": 0.8, "load15": 0.6 },
   "memory": { "total_mb": 16384, "used_mb": 8400, "percent": 51 },
   "disk_root_percent": 3,
+  "privileged": 1,
+  "netif": "eth0",
+  "net_traffic": { "rx_kbs": 1234, "tx_kbs": 89 },
+  "net_bw_status": "nethogs运行中",
   "processes": [
     { "pid": 1234, "cpu": 45, "rss_mb": 1228, "read_kbs": 8600,
       "write_kbs": 12200, "net": 12, "user": "app", "cmd": "java -jar gateway.jar",

@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.9"
+VERSION="0.3.0"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
@@ -117,6 +117,10 @@ cpu_total() {  # 输出 "total idle"
   echo "$(( $2 + $3 + $4 + idle + iowait + $7 + $8 + $9 )) $(( idle + iowait ))"
 }
 
+net_dev_total() {  # 输出 "rx_bytes tx_bytes"（汇总所有非回环网卡）
+  awk 'NR>2 { if ($1!="lo:") { rx+=$2; tx+=$10 } } END{print rx+0, tx+0}' /proc/net/dev 2>/dev/null
+}
+
 # 快速读取器：全部用 bash 内建（无外部子进程），结果写入全局变量
 T_TICKS1=0; T_TICKS2=0
 read_ticks() {  # $1=pid -> $T_TICKS1 $T_TICKS2
@@ -171,6 +175,7 @@ linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes use
   local pid u upid uu
   mkdir -p "$BASEDIR" 2>/dev/null || return 1
   cpu_total >"$BASEDIR/cpu_total"   # 保存整体 CPU 基线（供 collect 算差值）
+  net_dev_total >"$BASEDIR/net_dev" # 保存总流量基线（供 collect 算速率）
   declare -A USERS
   while read -r upid uu; do
     [[ $upid =~ ^[0-9]+$ ]] && USERS[$upid]=$uu
@@ -293,8 +298,12 @@ print_summary() {
   printf '  CPU %s%3d%%%s   负载 %s/%s/%s   内存 %s%4d/%dMB%s   磁盘/ %s%3d%%%s\n' \
     "$cp" "$CPU_SYS" "$C_OFF" "$L1" "$L5" "$L15" \
     "$mp" "$MEM_USED" "$MEM_TOTAL" "$C_OFF" "$dp" "$DISK_USE" "$C_OFF"
+  if [[ $OS == linux ]]; then
+    printf '  网络: ↓%s  ↑%s   (%s)\n' \
+      "$(hr_size $(( NET_RX * 1024 )))/s" "$(hr_size $(( NET_TX * 1024 )))/s" "$NETIF"
+  fi
   if [[ $OS == linux && $PRIVILEGED == 0 ]]; then
-    printf '  %s⚠ 当前非 root：磁盘IO / 连接数 / 带宽 不可用，请用 %ssudo smon%s 查看完整数据%s\n' \
+    printf '  %s⚠ 当前非 root：磁盘IO / 连接数 / 每进程带宽 不可用，请用 %ssudo smon%s 查看完整数据%s\n' \
       "$C_YEL" "$C_BLD" "$C_OFF" "$C_OFF"
   fi
   echo
@@ -393,6 +402,8 @@ json_escape() {  # 纯 bash 转义，避免每次 spawn sed
 emit_json() {  # 从 stdin 读 collect 数据
   local data; data=$(cat)
   load_sys_stats
+  net_rate
+  net_status
   local mp=$(( MEM_USED * 100 / (MEM_TOTAL?MEM_TOTAL:1) ))
   echo "{"
   printf '  "host": "%s",\n' "$(json_escape "$(hostname)")"
@@ -403,6 +414,8 @@ emit_json() {  # 从 stdin 读 collect 数据
   printf '  "disk_root_percent": %d,\n' "$DISK_USE"
   printf '  "privileged": %d,\n' "$PRIVILEGED"
   printf '  "netif": "%s",\n' "$(json_escape "$NETIF")"
+  echo "  \"net_traffic\": { \"rx_kbs\": $NET_RX, \"tx_kbs\": $NET_TX },"
+  printf '  "net_bw_status": "%s",\n' "$(json_escape "$NET_BW_STATUS")"
   echo "  \"processes\": ["
   local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
   while IFS=' ' read -r -a a; do
@@ -436,6 +449,30 @@ emit_json() {  # 从 stdin 读 collect 数据
 mac_snapshot() { :; }   # macOS 无速率采样
 if [[ $OS == linux ]]; then SNAP=linux_snapshot; else SNAP=mac_snapshot; fi
 
+NET_RX=0; NET_TX=0; NET_BW_STATUS=""
+net_rate() {  # 计算总收/总发速率(KB/s) -> $NET_RX $NET_TX（基于 snapshot 基线差值）
+  local rx0 tx0 rx1 tx1
+  NET_RX=0; NET_TX=0
+  [[ $OS == linux ]] || return 0
+  read -r rx0 tx0 <"$BASEDIR/net_dev" 2>/dev/null || { rx0=0; tx0=0; }
+  read -r rx1 tx1 < <(net_dev_total)
+  NET_RX=$(( (rx1 - rx0) / INTERVAL / 1024 )); [[ $NET_RX -lt 0 ]] && NET_RX=0
+  NET_TX=$(( (tx1 - tx0) / INTERVAL / 1024 )); [[ $NET_TX -lt 0 ]] && NET_TX=0
+}
+
+net_status() {  # 每进程带宽状态 -> $NET_BW_STATUS
+  NET_BW_STATUS="未启用"
+  if (( NET_BW )); then
+    NET_BW_STATUS="nethogs运行中"
+  elif [[ $OS != linux ]]; then
+    NET_BW_STATUS="macOS不支持"
+  elif [[ $EUID -ne 0 ]]; then
+    NET_BW_STATUS="非root"
+  elif ! command -v nethogs >/dev/null 2>&1; then
+    NET_BW_STATUS="未装nethogs"
+  fi
+}
+
 net_start() {
   NET_BW=0
   [[ $OS == linux && $EUID -eq 0 ]] || return 0
@@ -448,7 +485,7 @@ net_start() {
     [[ -z $NETIF ]] && NETIF=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null)
     [[ -z $NETIF ]] && NETIF=eth0
   fi
-  nethogs -t -d "$INTERVAL" "$NETIF" >"$BASEDIR/net.log" 2>/dev/null &
+  nethogs -t -d "$INTERVAL" "$NETIF" >"$BASEDIR/net.log" 2>"$BASEDIR/nethogs.err" &
   NETHOGS_PID=$!
   NET_BW=1
 }
@@ -467,6 +504,8 @@ main_tui() {
     esac
     tput clear; tput home; tput civis
     load_sys_stats
+    net_rate
+    net_status
     data=$(collect | sort_data)
     print_summary
     print_table <<<"$data"

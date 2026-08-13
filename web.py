@@ -112,18 +112,28 @@ function render(){
     document.getElementById('meta').textContent =
       `主机 ${data.host} · ${data.os} · ${data.uptime} · 负载 ${c.load1}/${c.load5}/${c.load15}` +
       (data.netif ? ` · 网卡 ${data.netif}` : '');
+    const nt=data.net_traffic||{};
+    const rx=(nt.rx_kbs||0)*1024, tx=(nt.tx_kbs||0)*1024;
+    const netCls = (rx+tx)>=10240 ? 'high' : ((rx+tx)>=2048 ? 'mid' : 'low');
+    const perProcHint = (data.net_bw_status && data.net_bw_status!=='nethogs运行中')
+      ? `每进程带宽: ${data.net_bw_status}` : '每进程带宽: nethogs';
     document.getElementById('cards').innerHTML =
       card('CPU 使用率', c.percent+'%', `负载 ${c.load1}`, cpuCls, c.percent) +
       card('内存', `${(m.used_mb/1024).toFixed(1)}G / ${(m.total_mb/1024).toFixed(1)}G`, `${m.percent}% 已用`, memCls, m.percent) +
       card('根分区 /', data.disk_root_percent+'%', '已用空间', lvl(data.disk_root_percent)[0], data.disk_root_percent) +
+      card('网络 总收/总发', `↓${fmtB(rx)}/s ↑${fmtB(tx)}/s`, perProcHint, netCls) +
       card('进程数', data.processes.length, '采样进程总数');
 
     const aEl=document.getElementById('alerts');
+    const nethogsNoData = (data.net_bw_status==='nethogs运行中') &&
+      (rx+tx)>1024 && !data.processes.some(p=>(p.recv_kbs||0)>0 || (p.sent_kbs||0)>0);
+    let extra='';
+    if(nethogsNoData) extra='<div class="a">⚠ 有总流量但每进程带宽为 0：nethogs 可能抓不到该网卡（虚拟网卡常见），可用 SMON_NETIF=<网卡> 指定，或先确认有流量在跑</div>';
     if(data.alerts&&data.alerts.length){
       aEl.innerHTML='<div class="a" style="background:none;border:none;color:var(--mut);padding:0 0 6px">⚠ 诊断建议</div>'+
-        data.alerts.map(a=>`<div class="a">${a}</div>`).join('');
+        data.alerts.map(a=>`<div class="a">${a}</div>`).join('')+extra;
     } else {
-      aEl.innerHTML='<div class="ok">✓ 系统各项指标正常</div>';
+      aEl.innerHTML='<div class="ok">✓ 系统各项指标正常</div>'+extra;
     }
 
     const rows=data.processes.slice();
