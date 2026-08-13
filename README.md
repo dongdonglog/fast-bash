@@ -12,13 +12,24 @@
 
 ## 快速开始
 
+**方式一：一键安装（推荐，需要 root）**
+
 ```bash
-# 一键安装（需要 root）
 curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
 
-# 或者直接运行
-bash smon.sh
+# 安装后直接运行命令（不是 bash smon.sh）
+smon -h        # 先确认可用
 ```
+
+**方式二：克隆仓库，在仓库目录里直接跑**
+
+```bash
+git clone https://github.com/dongdonglog/fast-bash.git && cd fast-bash
+bash smon.sh   # 注意：只有在仓库目录内才能这么跑
+```
+
+> ⚠️ 安装后请使用 `smon` 命令。`bash smon.sh` 只在当前目录存在 smon.sh 时有效（即方式二的仓库目录）。
+> 若提示 `smon: command not found`，见文末「安装后无法运行」排查。
 
 ## 使用
 
@@ -120,6 +131,20 @@ smon -j | python3 -m json.tool     # 校验并美化
 
 macOS 没有 `/proc`，自动降级为 `ps` 采集，**只提供 CPU% 和内存**，
 磁盘 IO / 网络连接数显示 `0`。以 Linux 服务器为主要目标平台。
+
+## 常见问题
+
+**安装后运行 `smon` 提示 `command not found`？**
+
+1. 确认已装到哪：`ls -l /usr/local/bin/smon`
+2. 确认该目录在 PATH：`echo $PATH | tr ':' '\n' | grep usr/local/bin`
+   - 苹果芯片(M1/M2/M3)的 macOS 若 `/usr/local/bin` 不在 PATH，可改用：
+     `sudo INSTALL_DIR=/opt/homebrew/bin bash install.sh`（或用 `brew`）
+3. 临时生效：`export PATH="/usr/local/bin:$PATH"`，再试 `smon -h`
+
+**`bash smon.sh: No such file or directory`？**
+
+那是没在仓库目录里跑。安装后请直接用 `smon`；想用文件方式运行，先 `cd` 到有 `smon.sh` 的目录。
 
 ## 项目结构
 

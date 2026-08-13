@@ -5,7 +5,16 @@
 set -euo pipefail
 
 BASE_URL="${SMON_BASE_URL:-https://raw.githubusercontent.com/dongdonglog/fast-bash/main}"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-}"
+
+# 选择安装目录：优先用户指定，否则按架构选 PATH 中可写的 bin 目录
+if [[ -z $INSTALL_DIR ]]; then
+  if [[ $(uname -m) == "arm64" ]] && [[ -d /opt/homebrew/bin ]]; then
+    INSTALL_DIR="/opt/homebrew/bin"
+  else
+    INSTALL_DIR="/usr/local/bin"
+  fi
+fi
 
 if [[ $EUID -ne 0 ]]; then
   echo "需要 root 权限安装到 $INSTALL_DIR，请使用 sudo 运行：" >&2
@@ -34,7 +43,14 @@ chmod +x "$INSTALL_DIR/smon"
 echo "[3/3] 验证 ..."
 if bash -n "$INSTALL_DIR/smon" && [[ -x "$INSTALL_DIR/smon" ]] && python3 -c "import ast; ast.parse(open('$INSTALL_DIR/web.py').read())" 2>/dev/null; then
   echo
-  echo "✅ 安装成功！直接运行："
+  echo "✅ 安装成功到 $INSTALL_DIR！"
+  if ! command -v smon >/dev/null 2>&1; then
+    echo "⚠️  提示：$INSTALL_DIR 不在当前 PATH 中，无法直接使用 smon。"
+    echo "   临时生效:  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "   永久生效:  把上面这行加入 ~/.zshrc 或 ~/.bashrc 后重新打开终端"
+    echo
+  fi
+  echo "直接运行："
   echo "   smon                    # 中文实时进程表"
   echo "   smon -m / -d / -n       # 按内存 / 磁盘IO / 网络 排序"
   echo "   smon -j                 # 输出 JSON"
