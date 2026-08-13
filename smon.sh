@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.3"
+VERSION="0.2.4"
 INTERVAL=2
 SORT_KEY=cpu
 JSON_MODE=0
@@ -168,6 +168,7 @@ num() {  # 强制转为数字（防字段错位），结果写入 $NUMOUT（无�
 linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes user"
   local pid u upid uu
   mkdir -p "$BASEDIR" 2>/dev/null || return 1
+  cpu_total >"$BASEDIR/cpu_total"   # 保存整体 CPU 基线（供 collect 算差值）
   declare -A USERS
   while read -r upid uu; do
     [[ $upid =~ ^[0-9]+$ ]] && USERS[$upid]=$uu
@@ -195,8 +196,10 @@ net_bw_read() {
 }
 
 linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
-  local ptot pide pid rss np
+  local ptot pide btot bide pid rss np
   read -r ptot pide < <(cpu_total)
+  read -r btot bide <"$BASEDIR/cpu_total" 2>/dev/null || { btot=$ptot; bide=$pide; }
+  ptot=$(( ptot - btot )); pide=$(( pide - bide ))   # 整体 CPU 差值（非累计值）
   declare -A NETCNT
   while read -r np; do
     [[ $np =~ ^pid=[0-9]+$ ]] && (( NETCNT[${np#pid=}]++ ))
@@ -221,7 +224,6 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
     nc=${NETCNT[$pid]:-0}
     local name
     read_cmdline "$pid"; name=$CMDLINE; name=${name:0:50}
-    [[ -z $name ]] && name="${u1:0:50}"
     [[ -z $name ]] && name="<内核线程>"
     if (( NET_BW )); then
       local rv=0 sv=0 bw
@@ -438,6 +440,11 @@ main_tui() {
   $SNAP
   local key data
   while :; do
+    read -rt "$INTERVAL" -n1 -s key || key=''
+    case "$key" in
+      c) SORT_KEY=cpu ;; m) SORT_KEY=mem ;; d) SORT_KEY=disk ;; n) SORT_KEY=net ;;
+      q) break ;;
+    esac
     tput clear; tput home; tput civis
     load_sys_stats
     data=$(collect | sort_data)
@@ -445,11 +452,6 @@ main_tui() {
     print_table <<<"$data"
     collect_alerts <<<"$data"
     print_diag
-    read -rt "$INTERVAL" -n1 -s key || key=''
-    case "$key" in
-      c) SORT_KEY=cpu ;; m) SORT_KEY=mem ;; d) SORT_KEY=disk ;; n) SORT_KEY=net ;;
-      q) break ;;
-    esac
     $SNAP
   done
 }
