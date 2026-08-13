@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 INTERVAL=2
 SORT_KEY=cpu
 JSON_MODE=0
@@ -21,7 +21,14 @@ C_BLD=$'\e[1m'; C_OFF=$'\e[0m'
 restore_tty() { stty sane 2>/dev/null; }
 net_stop()    { [[ -n $NETHOGS_PID ]] && kill "$NETHOGS_PID" 2>/dev/null; }
 TUI_RUNNING=0
-trap 'net_stop; rm -rf "$BASEDIR"; restore_tty; (( TUI_RUNNING )) && tput cnorm 2>/dev/null' EXIT INT TERM
+cleanup() {
+  net_stop
+  rm -rf "$BASEDIR"
+  restore_tty
+  (( TUI_RUNNING )) && tput cnorm 2>/dev/null
+}
+trap 'exit 1' INT TERM
+trap 'cleanup' EXIT
 
 usage() {
   cat <<EOF
@@ -123,11 +130,14 @@ pid_io()  { local pid=$1; awk '/^read_bytes/{r=$2} /^write_bytes/{w=$2} END{prin
 
 pid_cmdline() {
   local pid=$1
-  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    tr '\0' ' ' <"/proc/$pid/cmdline"
+  fi
 }
 
 linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes user"
   local pid u s r i
+  mkdir -p "$BASEDIR" 2>/dev/null || return 1
   for pdir in /proc/[0-9]*; do
     pid=${pdir##*/}
     [[ -r "/proc/$pid/stat" ]] || continue
