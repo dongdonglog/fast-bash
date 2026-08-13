@@ -5,7 +5,7 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.2.6"
+VERSION="0.2.7"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
@@ -461,11 +461,11 @@ if (( SERVE )); then
   if [[ -f "$smon_dir/web.py" ]]; then web="$smon_dir/web.py"
   elif [[ -f "$smon_dir/smon-web.py" ]]; then web="$smon_dir/smon-web.py"
   else
-    echo "未找到 web.py，请将 web.py 与 smon.sh 放在同一目录" >&2
+    echo "未找到 web.py，请将 web.py 与 smon 放在同一目录" >&2
     exit 1
   fi
   command -v python3 >/dev/null 2>&1 || { echo "Web 面板需要 python3，请先安装" >&2; exit 1; }
-  exec python3 "$web" "$smon_dir/smon.sh" "$SERVE_PORT"
+  exec python3 "$web" "${BASH_SOURCE[0]}" "$SERVE_PORT"
 fi
 
 if (( JSON_MODE )); then

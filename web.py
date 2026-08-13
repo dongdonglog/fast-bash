@@ -12,7 +12,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SMON = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "smon.sh")
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_SMON_CAND = [os.path.join(_DIR, "smon.sh"), os.path.join(_DIR, "smon")]
+SMON = sys.argv[1] if len(sys.argv) > 1 else next((p for p in _SMON_CAND if os.path.exists(p)), _SMON_CAND[0])
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 REFRESH = 5  # 后台采样刷新间隔（秒）
 
