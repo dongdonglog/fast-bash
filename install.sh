@@ -5,7 +5,6 @@
 set -euo pipefail
 
 BASE_URL="${SMON_BASE_URL:-https://raw.githubusercontent.com/dongdonglog/fast-bash/main}"
-MIRROR_URL="${SMON_MIRROR_URL:-https://cdn.jsdelivr.net/gh/dongdonglog/fast-bash@main}"
 INSTALL_DIR="${INSTALL_DIR:-}"
 
 # 选择安装目录：优先用户指定，否则按架构选 PATH 中可写的 bin 目录
@@ -23,26 +22,15 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-fetch() {  # $1=文件名(如 smon.sh) $2=dest；主源失败自动回退镜像，curl 带重试
-  local f=$1 dest=$2 u
-  local urls=("$BASE_URL/$f" "$MIRROR_URL/$f")
-  for u in "${urls[@]}"; do
-    if command -v curl >/dev/null; then
-      if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 "$u" -o "$dest" 2>/dev/null; then
-        return 0
-      fi
-    elif command -v wget >/dev/null; then
-      if wget -qO "$dest" "$u" 2>/dev/null; then
-        return 0
-      fi
-    else
-      echo "未找到 curl 或 wget" >&2
-      exit 1
-    fi
-    echo "  [重试] $u 失败，尝试下一个源 ..." >&2
-  done
-  echo "下载 $f 失败（主源与镜像均不可达）" >&2
-  return 1
+fetch() {  # $1=url $2=dest
+  if command -v curl >/dev/null; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null; then
+    wget -qO "$2" "$1"
+  else
+    echo "未找到 curl 或 wget" >&2
+    exit 1
+  fi
 }
 
 echo "[1/3] 下载 smon 与 web 面板 ..."
