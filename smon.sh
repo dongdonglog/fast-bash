@@ -5,15 +5,13 @@
 # 用法:  smon [选项]
 set -o pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 INTERVAL=5
 SORT_KEY=cpu
 JSON_MODE=0
 NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 PRIVILEGED=0; [[ $EUID -eq 0 ]] && PRIVILEGED=1
 BASEDIR=$(mktemp -d "${TMPDIR:-/tmp}/smon.XXXXXX") || exit 1
-NETHOGS_PID=""
-NET_BW=0
 NETIF=""
 
 # 颜色
@@ -21,10 +19,8 @@ C_RED=$'\e[31m'; C_YEL=$'\e[33m'; C_GRN=$'\e[32m'; C_CYN=$'\e[36m'
 C_BLD=$'\e[1m'; C_OFF=$'\e[0m'
 
 restore_tty() { stty sane 2>/dev/null; }
-net_stop()    { [[ -n $NETHOGS_PID ]] && kill "$NETHOGS_PID" 2>/dev/null; }
 TUI_RUNNING=0
 cleanup() {
-  net_stop
   rm -rf "$BASEDIR"
   restore_tty
   (( TUI_RUNNING )) && tput cnorm 2>/dev/null
@@ -49,10 +45,10 @@ smon v$VERSION - 中文进程占用实时排障工具
 交互快捷键（实时模式）:
   c=按CPU  m=按内存  d=按磁盘IO  n=按网络  q=退出
 
-数据来源（Linux）: /proc/<pid>/stat, status, io; ss -p; nethogs(可选)
+数据来源（Linux）: /proc/<pid>/stat, status, io; /proc/net/dev; ss -iepn(TCP_INFO)
   * CPU% 为单个核心百分比（100% = 吃满一核）
   * 磁盘 IO 需 root 才能读取其他用户进程
-  * 每进程网络默认显示连接数；root + 安装 nethogs 时自动升级为实时带宽(收↓/发↑)
+  * 网络：总收/总发（接口级）+ 每进程 TCP 带宽（ss -i 内核计数器，root 才完整）
   * 占用高自动高亮: 红(≥90%) 黄(≥60%) 绿(正常)
 EOF
 }
@@ -171,11 +167,27 @@ num() {  # 强制转为数字（防字段错位），结果写入 $NUMOUT（无�
   [[ $v =~ ^-?[0-9]+$ ]] && NUMOUT=$v || NUMOUT=0
 }
 
+ss_bw() {  # 输出 "pid bytes_acked bytes_received"（TCP 每连接累计字节，来自内核 TCP_INFO，纯内置）
+  ss -iepn 2>/dev/null | awk '
+    /^tcp/ {
+      pid=""
+      if (match($0, /pid=[0-9]+/)) pid=substr($0, RSTART+4, RLENGTH-4)
+      getline
+      a=0; r=0
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^bytes_acked:/) { sub(/^bytes_acked:/,"",$i); a=$i }
+        else if ($i ~ /^bytes_received:/) { sub(/^bytes_received:/,"",$i); r=$i }
+      }
+      if (pid ~ /^[0-9]+$/ && pid != 0) print pid, a, r
+    }'
+}
+
 linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes user"
   local pid u upid uu
   mkdir -p "$BASEDIR" 2>/dev/null || return 1
   cpu_total >"$BASEDIR/cpu_total"   # 保存整体 CPU 基线（供 collect 算差值）
   net_dev_total >"$BASEDIR/net_dev" # 保存总流量基线（供 collect 算速率）
+  ss_bw >"$BASEDIR/net_bw"          # 保存每进程 TCP 字节基线（供 collect 算带宽）
   declare -A USERS
   while read -r upid uu; do
     [[ $upid =~ ^[0-9]+$ ]] && USERS[$upid]=$uu
@@ -191,22 +203,7 @@ linux_snapshot() {  # 建立基线: 每文件 "utime stime rss rbytes wbytes use
   done
 }
 
-# nethogs 带宽: root 且已安装时，输出 "pid recv_kbs sent_kbs" 每行
-net_bw_read() {
-  tail -n 300 "$BASEDIR/net.log" 2>/dev/null | awk '
-    /^Refreshing:/{next}
-    {
-      n=split($0,a,"/");
-      if (n < 3) next
-      pid=a[2];
-      if (pid ~ /^[0-9]+$/ && pid != 0) {
-        m=split(a[3],b,"\t");
-        if (m >= 3) print pid, b[3], b[2]
-      }
-    }'
-}
-
-linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
+linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user rxKB txKB name
   local ptot pide btot bide pid rss np
   read -r ptot pide < <(cpu_total)
   read -r btot bide <"$BASEDIR/cpu_total" 2>/dev/null || { btot=$ptot; bide=$pide; }
@@ -215,8 +212,10 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
   while read -r np; do
     [[ $np =~ ^pid=[0-9]+$ ]] && (( NETCNT[${np#pid=}]++ ))
   done < <( { ss -tpnH 2>/dev/null; ss -unpH 2>/dev/null; } | grep -o 'pid=[0-9]*' )
-  local nbw=""
-  if (( NET_BW )); then nbw=$(net_bw_read); fi
+  declare -A BWA BWR CWA CWR
+  local bp ba br cp ca cr
+  while read -r bp ba br; do BWA[$bp]=$ba; BWR[$bp]=$br; done <"$BASEDIR/net_bw" 2>/dev/null
+  while read -r cp ca cr; do CWA[$cp]=$ca; CWR[$cp]=$cr; done < <(ss_bw)
   for pdir in /proc/[0-9]*; do
     pid=${pdir##*/}
     [[ -r "/proc/$pid/stat" && -f "$BASEDIR/$pid" ]] || continue
@@ -225,7 +224,7 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
     num "$t1"; t1=$NUMOUT; num "$t0"; t0=$NUMOUT
     num "$rb0"; rb0=$NUMOUT; num "$wb0"; wb0=$NUMOUT
     read_ticks "$pid"
-    local cpu=0 rk=0 wk=0 nc=0
+    local cpu=0 rk=0 wk=0 nc=0 rx=0 tx=0
     local dp=$(( (T_TICKS1 + T_TICKS2) - (t1 + t0) ))
     if (( ptot > 0 && dp > 0 )); then cpu=$(( dp * NCPU * 100 / ptot )); fi
     read_rss "$pid"; rss=$RSSKB
@@ -233,30 +232,19 @@ linux_collect() {  # 每行: pid cpu rssKB rKB wKB net user name [recv sent]
     rk=$(( (IO_R - rb0) / INTERVAL / 1024 )); [[ $rk -lt 0 ]] && rk=0
     wk=$(( (IO_W - wb0) / INTERVAL / 1024 )); [[ $wk -lt 0 ]] && wk=0
     nc=${NETCNT[$pid]:-0}
+    rx=$(( (${CWR[$pid]:-0} - ${BWR[$pid]:-0}) / INTERVAL / 1024 )); [[ $rx -lt 0 ]] && rx=0
+    tx=$(( (${CWA[$pid]:-0} - ${BWA[$pid]:-0}) / INTERVAL / 1024 )); [[ $tx -lt 0 ]] && tx=0
     local name
     read_cmdline "$pid"; name=$CMDLINE; name=${name:0:50}
     [[ -z $name ]] && name="<内核线程>"
-    if (( NET_BW )); then
-      local rv=0 sv=0 bw
-      bw=$(grep -m1 "^$pid " <<<"$nbw")
-      if [[ -n $bw ]]; then
-        # shellcheck disable=SC2086
-        set -- $bw
-        rv=${2:-0}; sv=${3:-0}
-        rv=${rv%.*}; sv=${sv%.*}
-        num "$rv"; rv=$NUMOUT; num "$sv"; sv=$NUMOUT
-      fi
-      printf '%s %s %s %s %s %s %s %s %s %s\n' "$pid" "$cpu" "$rss" "$rk" "$wk" "$nc" "$u1" "$rv" "$sv" "$name"
-    else
-      printf '%s %s %s %s %s %s %s %s\n' "$pid" "$cpu" "$rss" "$rk" "$wk" "$nc" "$u1" "$name"
-    fi
+    printf '%s %s %s %s %s %s %s %s %s %s\n' "$pid" "$cpu" "$rss" "$rk" "$wk" "$nc" "$u1" "$rx" "$tx" "$name"
   done
 }
 
 # ------------------------- macOS 降级采集 -------------------------
-mac_collect() {  # 每行: pid cpu rssKB rKB wKB net user name
+mac_collect() {  # 每行: pid cpu rssKB rKB wKB net user rxKB txKB name
   while read -r p u c r n; do
-    printf '%s %s %s 0 0 0 %s %s\n' "$p" "${c%.*}" "$(( r / 1024 ))" "$u" "$n"
+    printf '%s %s %s 0 0 0 %s 0 0 %s\n' "$p" "${c%.*}" "$(( r / 1024 ))" "$u" "$n"
   done < <(ps -axo pid=,user=,%cpu=,rss=,comm=)
 }
 
@@ -313,12 +301,13 @@ print_summary() {
 ALERTS=()
 collect_alerts() {  # 读取 collect 数据(stdin)，产出诊断建议到 ALERTS
   ALERTS=()
-  local a topio_pid=0 topio_rk=0 topnet_pid=0 topnet_nc=0 pid rk nc rv sv nb
+  local a topio_pid=0 topio_rk=0 topnet_pid=0 topnet_nc=0 topbw_pid=0 topbw_kb=0 pid rk nc rx tx
   while IFS=' ' read -r -a a; do
-    num "${a[0]}"; pid=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT
+    num "${a[0]}"; pid=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; num "${a[7]}"; rx=$NUMOUT; num "${a[8]}"; tx=$NUMOUT
     (( rk > topio_rk )) && { topio_rk=$rk; topio_pid=$pid; }
-    if (( NET_BW )); then nb=$(( rv + sv )); else nb=$nc; fi
-    (( nb > topnet_nc )) && { topnet_nc=$nb; topnet_pid=$pid; }
+    (( nc > topnet_nc )) && { topnet_nc=$nc; topnet_pid=$pid; }
+    local bw=$(( rx + tx ))
+    (( bw > topbw_kb )) && { topbw_kb=$bw; topbw_pid=$pid; }
   done
   (( CPU_SYS >= 90 )) && ALERTS+=("CPU 使用率 ${CPU_SYS}% 过高，重点看占用最高的进程（已按 CPU 排序）")
   local mp=$(( MEM_USED * 100 / (MEM_TOTAL?MEM_TOTAL:1) ))
@@ -326,11 +315,8 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出诊断建议到 ALERT
   float_gt "$L1" "$NCPU" && ALERTS+=("1分钟负载 ${L1} 超过核数(${NCPU})，疑似高并发或 IO 阻塞")
   (( DISK_USE >= 85 )) && ALERTS+=("根分区使用 ${DISK_USE}% 接近满，清理: du -sh /* 2>/dev/null | sort -rh | head")
   (( topio_rk >= 51200 )) && ALERTS+=("PID ${topio_pid} 磁盘读 ${topio_rk}KB/s 过高，查看: iostat -x 1")
-  if (( NET_BW )); then
-    (( topnet_nc >= 1024 )) && ALERTS+=("PID ${topnet_pid} 网络带宽 ${topnet_nc}KB/s 过高，查看: nethogs")
-  else
-    (( topnet_nc >= 500 )) && ALERTS+=("PID ${topnet_pid} TCP/UDP 连接 ${topnet_nc} 过多，查看: ss -tn state established")
-  fi
+  (( topbw_kb >= 10240 )) && ALERTS+=("PID ${topbw_pid} TCP 带宽 ${topbw_kb}KB/s 过高，重点排查该进程")
+  (( topnet_nc >= 500 )) && ALERTS+=("PID ${topnet_pid} TCP/UDP 连接 ${topnet_nc} 过多，查看: ss -tn state established")
 }
 
 print_diag() {
@@ -350,32 +336,22 @@ print_diag() {
 print_table() {  # 从 stdin 读 collect 数据（已排序）
   local k
   case "$SORT_KEY" in mem) k=3 ;; disk) k=4 ;; net) k=6 ;; *) k=2 ;; esac
-  if (( NET_BW )); then
-    printf '%-7s %6s %7s %7s %7s %5s %7s %7s  %-10s %s\n' 'PID' 'CPU%' '内存' '读IO' '写IO' '连接' '收↓' '发↑' '用户' '命令'
-  else
-    printf '%-7s %6s %7s %7s %7s %5s  %-10s %s\n' 'PID' 'CPU%' '内存' '读IO' '写IO' '连接' '用户' '命令'
-  fi
-  local a lines=0 pid cpu rss rk wk nc u nm rv sv mem_pct
+  printf '%-7s %6s %7s %7s %7s %5s %7s %7s  %-10s %s\n' 'PID' 'CPU%' '内存' '读IO' '写IO' '连接' '收↓' '发↑' '用户' '命令'
+  local a lines=0 pid cpu rss rk wk nc u nm rx tx mem_pct
   while IFS=' ' read -r -a a; do
     (( lines++ )); (( lines > 20 )) && break
-    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}
-    if (( NET_BW )); then num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}; num "${a[7]}"; rx=$NUMOUT; num "${a[8]}"; tx=$NUMOUT; nm="${a[*]:9}"
     mem_pct=$(( rss * 100 / (( MEM_TOTAL?MEM_TOTAL:1) * 1024) ))
-    local pc mc ic ncc
+    local pc mc ic ncc nwc
     pc=$(color_pct "$cpu")
     mc=$(color_pct "$mem_pct")
     ic=$(color_io "$rk"); [[ $(color_io "$wk") == "$C_RED$C_BLD" ]] && ic=$C_RED$C_BLD
-    if (( NET_BW )); then
-      ncc=$(color_io "$(( rv + sv ))")
-      printf '%-7s %s%6s%%%s %s%7s%s %s%7s%s %s%7s%s %5s %7s %7s  %-10s %s\n' \
-        "$pid" "$pc" "$cpu" "$C_OFF" "$mc" "$(hr_size $(( rss * 1024 )))" "$C_OFF" \
-        "$ic" "$rk" "$C_OFF" "$ic" "$wk" "$C_OFF" "$nc" "$rv" "$sv" "$u" "$nm"
-    else
-      ncc=$(color_conn "$nc")
-      printf '%-7s %s%6s%%%s %s%7s%s %s%7s%s %s%7s%s %s%5s%s  %-10s %s\n' \
-        "$pid" "$pc" "$cpu" "$C_OFF" "$mc" "$(hr_size $(( rss * 1024 )))" "$C_OFF" \
-        "$ic" "$rk" "$C_OFF" "$ic" "$wk" "$C_OFF" "$ncc" "$nc" "$C_OFF" "$u" "$nm"
-    fi
+    ncc=$(color_conn "$nc")
+    nwc=$(color_io "$(( rx + tx ))")
+    printf '%-7s %s%6s%%%s %s%7s%s %s%7s%s %s%7s%s %s%5s%s %s%7s%s %s%7s%s  %-10s %s\n' \
+      "$pid" "$pc" "$cpu" "$C_OFF" "$mc" "$(hr_size $(( rss * 1024 )))" "$C_OFF" \
+      "$ic" "$rk" "$C_OFF" "$ic" "$wk" "$C_OFF" "$ncc" "$nc" "$C_OFF" \
+      "$nwc" "$rx" "$C_OFF" "$nwc" "$tx" "$C_OFF" "$u" "$nm"
   done
   echo
   printf '  [排序: %s]  c=CPU  m=内存  d=磁盘IO  n=网络  q=退出\n' "$SORT_KEY"
@@ -384,7 +360,7 @@ print_table() {  # 从 stdin 读 collect 数据（已排序）
 sort_data() {  # 按当前排序键排序 stdin
   local k
   case "$SORT_KEY" in mem) k=3 ;; disk) k=4 ;; net) k=6 ;; *) k=2 ;; esac
-  if [[ $SORT_KEY == net && $NET_BW == 1 ]]; then
+  if [[ $SORT_KEY == net ]]; then
     awk '{print $8+$9, $0}' | sort -t' ' -k1 -rn | cut -d' ' -f2-
   else
     sort -t' ' -k"$k" -rn
@@ -403,7 +379,6 @@ emit_json() {  # 从 stdin 读 collect 数据
   local data; data=$(cat)
   load_sys_stats
   net_rate
-  net_status
   local mp=$(( MEM_USED * 100 / (MEM_TOTAL?MEM_TOTAL:1) ))
   echo "{"
   printf '  "host": "%s",\n' "$(json_escape "$(hostname)")"
@@ -415,20 +390,16 @@ emit_json() {  # 从 stdin 读 collect 数据
   printf '  "privileged": %d,\n' "$PRIVILEGED"
   printf '  "netif": "%s",\n' "$(json_escape "$NETIF")"
   echo "  \"net_traffic\": { \"rx_kbs\": $NET_RX, \"tx_kbs\": $NET_TX },"
-  printf '  "net_bw_status": "%s",\n' "$(json_escape "$NET_BW_STATUS")"
   echo "  \"processes\": ["
-  local first=1 a pid cpu rss rk wk nc u nm rv sv u2 nm2
+  local first=1 a pid cpu rss rk wk nc u nm rx tx u2 nm2
   while IFS=' ' read -r -a a; do
-    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}
-    if (( NET_BW )); then num "${a[7]}"; rv=$NUMOUT; num "${a[8]}"; sv=$NUMOUT; nm="${a[*]:9}"; else rv=0; sv=0; nm="${a[*]:7}"; fi
+    num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}; num "${a[7]}"; rx=$NUMOUT; num "${a[8]}"; tx=$NUMOUT; nm="${a[*]:9}"
     u2=${u//\\/\\\\}; u2=${u2//\"/\\\"}
     nm2=${nm//\\/\\\\}; nm2=${nm2//\"/\\\"}
     (( first )) || echo ","
     first=0
-    printf '    { "pid": %s, "cpu": %s, "rss_mb": %s, "read_kbs": %s, "write_kbs": %s, "net": %s, "user": "%s", "cmd": "%s"' \
-      "$pid" "$cpu" "$(( rss / 1024 ))" "$rk" "$wk" "$nc" "$u2" "$nm2"
-    (( NET_BW )) && printf ', "recv_kbs": %s, "sent_kbs": %s' "$rv" "$sv"
-    printf ' }'
+    printf '    { "pid": %s, "cpu": %s, "rss_mb": %s, "read_kbs": %s, "write_kbs": %s, "net": %s, "user": "%s", "cmd": "%s", "recv_kbs": %s, "sent_kbs": %s}' \
+      "$pid" "$cpu" "$(( rss / 1024 ))" "$rk" "$wk" "$nc" "$u2" "$nm2" "$rx" "$tx"
   done <<<"$data"
   echo
   echo "  ],"
@@ -449,7 +420,7 @@ emit_json() {  # 从 stdin 读 collect 数据
 mac_snapshot() { :; }   # macOS 无速率采样
 if [[ $OS == linux ]]; then SNAP=linux_snapshot; else SNAP=mac_snapshot; fi
 
-NET_RX=0; NET_TX=0; NET_BW_STATUS=""
+NET_RX=0; NET_TX=0
 net_rate() {  # 计算总收/总发速率(KB/s) -> $NET_RX $NET_TX（基于 snapshot 基线差值）
   local rx0 tx0 rx1 tx1
   NET_RX=0; NET_TX=0
@@ -460,40 +431,21 @@ net_rate() {  # 计算总收/总发速率(KB/s) -> $NET_RX $NET_TX（基于 snap
   NET_TX=$(( (tx1 - tx0) / INTERVAL / 1024 )); [[ $NET_TX -lt 0 ]] && NET_TX=0
 }
 
-net_status() {  # 每进程带宽状态 -> $NET_BW_STATUS
-  NET_BW_STATUS="未启用"
-  if (( NET_BW )); then
-    NET_BW_STATUS="nethogs运行中"
-  elif [[ $OS != linux ]]; then
-    NET_BW_STATUS="macOS不支持"
-  elif [[ $EUID -ne 0 ]]; then
-    NET_BW_STATUS="非root"
-  elif ! command -v nethogs >/dev/null 2>&1; then
-    NET_BW_STATUS="未装nethogs"
-  fi
-}
-
-net_start() {
-  NET_BW=0
-  [[ $OS == linux && $EUID -eq 0 ]] || return 0
-  command -v nethogs >/dev/null 2>&1 || return 0
-  NETIF=""
+detect_netif() {  # 探测主要网卡（用于展示）
+  [[ $OS == linux ]] || return 0
   if [[ -n $SMON_NETIF ]]; then
-    NETIF=$SMON_NETIF   # 用户显式指定网卡（默认走自动探测）
+    NETIF=$SMON_NETIF
   else
     NETIF=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}')
     [[ -z $NETIF ]] && NETIF=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null)
-    [[ -z $NETIF ]] && NETIF=eth0
+    [[ -z $NETIF ]] && NETIF=""
   fi
-  nethogs -t -d "$INTERVAL" "$NETIF" >"$BASEDIR/net.log" 2>"$BASEDIR/nethogs.err" &
-  NETHOGS_PID=$!
-  NET_BW=1
 }
+detect_netif
 
 main_tui() {
   # shellcheck disable=SC2034
   TUI_RUNNING=1
-  net_start
   $SNAP
   local key data
   while :; do
@@ -505,7 +457,6 @@ main_tui() {
     tput clear; tput home; tput civis
     load_sys_stats
     net_rate
-    net_status
     data=$(collect | sort_data)
     print_summary
     print_table <<<"$data"
@@ -529,9 +480,7 @@ fi
 
 if (( JSON_MODE )); then
   if [[ $OS == linux ]]; then
-    net_start
-    linux_snapshot
-    if (( NET_BW )); then sleep $(( INTERVAL + 2 )); else sleep "$INTERVAL"; fi
+    linux_snapshot; sleep "$INTERVAL"
   fi
   collect | emit_json
 else

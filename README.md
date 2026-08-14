@@ -74,9 +74,9 @@ smon --serve 8080
   CPU  32%   负载 1.2/0.8/0.6   内存  8400/16384MB   磁盘/ 3%
   网络: ↓1.2MB/s  ↑0.3MB/s   (eth0)
 
-PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
-1234        45%   1.2G   8.4M   12M    12  2.1M 0.5M app      java -jar gateway.jar
- 987         8%    48M   0.1M  0.2M    34     0    0 www-data nginx: worker process
+PID       CPU%  内存   读IO   写IO 连接  用户     命令
+1234        45%   1.2G   8.4M   12M    12  app      java -jar gateway.jar
+ 987         8%    48M   0.1M  0.2M    34  www-data nginx: worker process
  ...
   [排序: cpu]  c=CPU  m=内存  d=磁盘IO  n=网络  q=退出
   ⚠ 诊断建议
@@ -97,11 +97,11 @@ PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
 | 内存 | `/proc/<pid>/status` 的 VmRSS | 精确物理内存占用 |
 | 磁盘 IO | `/proc/<pid>/io`（读写字节差值） | **需要 root** 才能读其他用户进程 |
 | 网络连接数 | `ss -p` 统计每进程 TCP/UDP 连接数 | 无需 root 即可统计 |
-| 网络总流量 | `/proc/net/dev` 差值 | **始终可靠**，无需 root/nethogs，显示 总收/总发 |
-| 每进程带宽 | `nethogs -t`（root + 已安装时自动启用） | best-effort：虚拟网卡可能抓不到，此时总流量仍可见 |
+| 网络总流量 | `/proc/net/dev` 差值 | **始终可靠**，无需 root，显示 总收/总发 |
+| 每进程连接数 | `ss -p` 统计 TCP/UDP 连接 | root 才完整（非 root 只统计自身） |
 
-> **带宽三层**：① 总收/总发（接口级，永远可靠）② 每进程连接数（ss -p）③ 每进程带宽（nethogs，best-effort）。
-> 非 root 时②③不可用，但①总流量始终显示。nethogs 抓不到时页面会提示（可 `SMON_NETIF=<网卡> smon --serve` 指定网卡）。
+> **网络数据纯内置，零外部工具**：① 总收/总发（接口级，永远可靠，无需 root）② 每进程连接数（ss -p）。
+> 不依赖 nethogs 等第三方工具。
 
 ### JSON 输出（`-j` / `--json`）
 
@@ -117,11 +117,9 @@ PID       CPU%  内存   读IO   写IO 连接 收↓  发↑  用户     命令
   "privileged": 1,
   "netif": "eth0",
   "net_traffic": { "rx_kbs": 1234, "tx_kbs": 89 },
-  "net_bw_status": "nethogs运行中",
   "processes": [
     { "pid": 1234, "cpu": 45, "rss_mb": 1228, "read_kbs": 8600,
-      "write_kbs": 12200, "net": 12, "user": "app", "cmd": "java -jar gateway.jar",
-      "recv_kbs": 2150, "sent_kbs": 512 }
+      "write_kbs": 12200, "net": 12, "user": "app", "cmd": "java -jar gateway.jar" }
   ],
   "alerts": [ "根分区使用 92% 接近满，清理: du -sh /* 2>/dev/null | sort -rh | head" ]
 }
