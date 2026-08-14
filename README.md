@@ -74,9 +74,9 @@ smon --serve 8080
   CPU  32%   负载 1.2/0.8/0.6   内存  8400/16384MB   磁盘/ 3%
   网络: ↓1.2MB/s  ↑0.3MB/s   (eth0)
 
-PID       CPU%  内存   读IO   写IO 连接  用户     命令
-1234        45%   1.2G   8.4M   12M    12  app      java -jar gateway.jar
- 987         8%    48M   0.1M  0.2M    34  www-data nginx: worker process
+PID       CPU%  内存   读IO   写IO 连接  收↓   发↑   用户     命令
+1234        45%   1.2G   8.4M   12M    12  2.1M  0.5M  app      java -jar gateway.jar
+ 987         8%    48M   0.1M  0.2M    34     0     0  www-data nginx: worker process
  ...
   [排序: cpu]  c=CPU  m=内存  d=磁盘IO  n=网络  q=退出
   ⚠ 诊断建议
@@ -88,6 +88,7 @@ PID       CPU%  内存   读IO   写IO 连接  用户     命令
 - **占用高亮**：占用 ≥90% 标红加粗、≥60% 标黄、正常绿色。
 - **诊断建议**：检测到 CPU/内存/负载/磁盘/IO/网络异常时，自动给出中文排查命令。
 - 顶部一行系统概况：CPU、负载、内存、根分区使用率、**总收/总发流量**（接口级，始终可靠）。
+- **每进程带宽**：收↓/发↑ 来自内核 `ss -i`(TCP_INFO) 每连接字节计数器，**纯内置**。
 
 ## 数据来源与说明
 
@@ -99,9 +100,11 @@ PID       CPU%  内存   读IO   写IO 连接  用户     命令
 | 网络连接数 | `ss -p` 统计每进程 TCP/UDP 连接数 | 无需 root 即可统计 |
 | 网络总流量 | `/proc/net/dev` 差值 | **始终可靠**，无需 root，显示 总收/总发 |
 | 每进程连接数 | `ss -p` 统计 TCP/UDP 连接 | root 才完整（非 root 只统计自身） |
+| 每进程带宽 | `ss -iepn` 的 TCP_INFO 字节计数器差值 | **纯内置**，无需 nethogs/eBPF；仅 TCP（UDP/QUIC 无计数器），root 才完整 |
 
-> **网络数据纯内置，零外部工具**：① 总收/总发（接口级，永远可靠，无需 root）② 每进程连接数（ss -p）。
-> 不依赖 nethogs 等第三方工具。
+> **网络数据全部纯内置，零外部工具**：① 总收/总发（接口级，永远可靠，无需 root）② 每进程连接数（ss -p）
+> ③ 每进程 TCP 带宽（`ss -i` 内核每连接字节计数器，如 `bytes_acked`/`bytes_received` 的差值）。
+> 这正是大多数开源工具不做、而 smon 用内置数据源做到的「每进程带宽」。
 
 ### JSON 输出（`-j` / `--json`）
 
@@ -136,14 +139,14 @@ smon -j | python3 -m json.tool     # 校验并美化
 
 ## 平台兼容
 
-**Linux（主要目标）**：完整能力 —— 每进程 CPU% / 内存 / 磁盘 IO / 网络（连接数 + nethogs 带宽）、
-诊断建议、Web 面板。磁盘 IO 与 nethogs 带宽需 root。
+**Linux（主要目标）**：完整能力 —— 每进程 CPU% / 内存 / 磁盘 IO / 网络（总流量 + 连接数 + 每进程 TCP 带宽）、
+诊断建议、Web 面板。磁盘 IO、连接数、每进程带宽需 root 才完整。
 
 **macOS**：没有 `/proc`，自动降级为 `ps` 采集，**提供 CPU% 和内存**（系统概况含内存/负载），
-每进程磁盘 IO 与网络连接数显示 `0`，Web 面板与 `-j` JSON 正常可用。
+每进程磁盘 IO 与网络数据为 `0`，Web 面板与 `-j` JSON 正常可用。
 
 > 两平台均支持：实时进程表、排序、占用高亮、系统概况、诊断建议、`-j` JSON、`--serve` Web 面板。
-> 差异仅在「每进程磁盘 IO / 网络带宽」这类依赖 Linux `/proc` 的指标。
+> 差异仅在「每进程磁盘 IO / 网络」这类依赖 Linux `/proc` / `ss` 的指标。
 
 ## 常见问题
 
