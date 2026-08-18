@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+      - name: Generate embedded BPF object
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev
+          internal/netmon/bpf/generate.sh
+          file internal/netmon/bpf/netmon_bpfel.o | grep -q 'eBPF'
+      - name: Test
+        run: go test ./...
+      - name: Build static offline bundles
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            bundle="dist/smon-linux-$arch"
+            mkdir -p "$bundle"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags="-s -w -X main.version=$VERSION" -o "$bundle/smon-net" ./cmd/smon-net
+            cp smon.sh "$bundle/smon"
+            cp web.py install.sh LICENSE THIRD_PARTY_NOTICES "$bundle/"
+            chmod 0755 "$bundle/smon" "$bundle/smon-net" "$bundle/install.sh"
+            (cd "$bundle" && sha256sum smon smon-net web.py install.sh LICENSE THIRD_PARTY_NOTICES > SHA256SUMS)
+            tar -C dist -czf "dist/smon-linux-$arch.tar.gz" "smon-linux-$arch"
+            (cd dist && sha256sum "smon-linux-$arch.tar.gz" > "smon-linux-$arch.tar.gz.sha256")
+          done
+          (cd dist && sha256sum smon-linux-*.tar.gz > SHA256SUMS)
+          file dist/smon-linux-amd64/smon-net dist/smon-linux-arm64/smon-net
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smon-offline-bundles
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS

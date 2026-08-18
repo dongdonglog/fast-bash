@@ -7,21 +7,46 @@ on:
     branches: [main]
 
 jobs:
-  shellcheck:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: 语法检查
-        run: bash -n smon.sh install.sh
-      - name: ShellCheck 静态检查
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+      - name: Generate embedded BPF object
         run: |
-          shellcheck smon.sh install.sh
-        # web.py 为 Python，已在本地 py_compile 验证，此处跳过
-      - name: 快速冒烟测试（JSON 输出）
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev
+          internal/netmon/bpf/generate.sh
+          file internal/netmon/bpf/netmon_bpfel.o | grep -q 'eBPF'
+      - name: Go tests
+        run: go test ./...
+      - name: Bash and Python checks
         run: |
-          bash -n smon.sh
-          python3 - <<'EOF'
-          import ast
-          ast.parse(open('web.py').read())
-          print("web.py 语法 OK")
-          EOF
+          bash -n smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh
+          shellcheck smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh
+          python3 -m py_compile web.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Cross-build static collectors
+        run: |
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o build/smon-net-amd64 ./cmd/smon-net
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o build/smon-net-arm64 ./cmd/smon-net
+          file build/smon-net-*
+      - name: Offline install and JSON smoke test
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/smon-linux-amd64"
+          install_dir="$RUNNER_TEMP/smon-bin"
+          doc_dir="$RUNNER_TEMP/smon-doc"
+          mkdir -p "$bundle"
+          cp smon.sh "$bundle/smon"
+          cp build/smon-net-amd64 "$bundle/smon-net"
+          cp web.py install.sh LICENSE THIRD_PARTY_NOTICES "$bundle/"
+          chmod +x "$bundle/smon" "$bundle/smon-net" "$bundle/install.sh"
+          sudo env INSTALL_DIR="$install_dir" SMON_DOC_DIR="$doc_dir" \
+            SMON_BASE_URL="http://127.0.0.1:9" bash "$bundle/install.sh"
+          "$install_dir/smon" -j | python3 -m json.tool >/dev/null
+          python3 -c "import json,subprocess; d=json.loads(subprocess.check_output(['$install_dir/smon','-j'])); assert d['net_attribution']['status'] in ('ok','partial')"

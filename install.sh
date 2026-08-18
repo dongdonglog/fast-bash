@@ -1,63 +1,86 @@
 #!/usr/bin/env bash
 #
-# smon 一键安装脚本
-# 用法:  curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
+# smon 安装脚本。离线包中直接运行；通过 curl 运行时下载对应架构的发布包。
 set -euo pipefail
 
-BASE_URL="${SMON_BASE_URL:-https://raw.githubusercontent.com/dongdonglog/fast-bash/main}"
-INSTALL_DIR="${INSTALL_DIR:-}"
+BASE_URL="${SMON_BASE_URL:-https://github.com/dongdonglog/fast-bash/releases/latest/download}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
+if ! SCRIPT_DIR=$(cd "$SCRIPT_DIR" 2>/dev/null && pwd); then SCRIPT_DIR=$(pwd); fi
+WORK_DIR=""
 
-# 选择安装目录：优先用户指定，否则按架构选 PATH 中可写的 bin 目录
-if [[ -z $INSTALL_DIR ]]; then
-  if [[ $(uname -m) == "arm64" ]] && [[ -d /opt/homebrew/bin ]]; then
-    INSTALL_DIR="/opt/homebrew/bin"
-  else
-    INSTALL_DIR="/usr/local/bin"
-  fi
-fi
+cleanup() {
+  [[ -z $WORK_DIR ]] || rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 if [[ $EUID -ne 0 ]]; then
-  echo "需要 root 权限安装到 $INSTALL_DIR，请使用 sudo 运行：" >&2
-  echo "  curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash" >&2
+  echo "需要 root 权限安装到 $INSTALL_DIR，请使用 sudo 运行" >&2
+  exit 1
+fi
+if [[ $(uname -s) != Linux ]]; then
+  echo "smon 0.5 的完整安装包仅支持 Linux amd64/arm64" >&2
   exit 1
 fi
 
+case $(uname -m) in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
+esac
+
 fetch() {  # $1=url $2=dest
-  if command -v curl >/dev/null; then
-    curl -fsSL "$1" -o "$2"
-  elif command -v wget >/dev/null; then
-    wget -qO "$2" "$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 10 "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$2" "$1"
   else
     echo "未找到 curl 或 wget" >&2
     exit 1
   fi
 }
 
-echo "[1/3] 下载 smon 与 web 面板 ..."
-fetch "$BASE_URL/smon.sh" "$INSTALL_DIR/smon"
-fetch "$BASE_URL/web.py" "$INSTALL_DIR/web.py"
-
-echo "[2/3] 设置可执行权限 ..."
-chmod +x "$INSTALL_DIR/smon"
-
-echo "[3/3] 验证 ..."
-if bash -n "$INSTALL_DIR/smon" && [[ -x "$INSTALL_DIR/smon" ]] && python3 -c "import ast; ast.parse(open('$INSTALL_DIR/web.py').read())" 2>/dev/null; then
-  echo
-  echo "✅ 安装成功到 $INSTALL_DIR！"
-  if ! command -v smon >/dev/null 2>&1; then
-    echo "⚠️  提示：$INSTALL_DIR 不在当前 PATH 中，无法直接使用 smon。"
-    echo "   临时生效:  export PATH=\"$INSTALL_DIR:\$PATH\""
-    echo "   永久生效:  把上面这行加入 ~/.zshrc 或 ~/.bashrc 后重新打开终端"
-    echo
+SOURCE_DIR=$SCRIPT_DIR
+SMON_SOURCE="$SOURCE_DIR/smon"
+[[ -f $SMON_SOURCE ]] || SMON_SOURCE="$SOURCE_DIR/smon.sh"
+if [[ ! -f $SMON_SOURCE || ! -x $SOURCE_DIR/smon-net || ! -f $SOURCE_DIR/web.py || \
+      ! -f $SOURCE_DIR/LICENSE || ! -f $SOURCE_DIR/THIRD_PARTY_NOTICES ]]; then
+  WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/smon-install.XXXXXX")
+  ARCHIVE="smon-linux-$ARCH.tar.gz"
+  echo "本地资产不完整，下载 $ARCHIVE ..."
+  fetch "$BASE_URL/$ARCHIVE" "$WORK_DIR/$ARCHIVE"
+  fetch "$BASE_URL/$ARCHIVE.sha256" "$WORK_DIR/$ARCHIVE.sha256"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$WORK_DIR" && sha256sum -c "$ARCHIVE.sha256")
+  elif command -v shasum >/dev/null 2>&1; then
+    expected=$(awk '{print $1}' "$WORK_DIR/$ARCHIVE.sha256")
+    actual=$(shasum -a 256 "$WORK_DIR/$ARCHIVE" | awk '{print $1}')
+    [[ $actual == "$expected" ]] || { echo "SHA-256 校验失败" >&2; exit 1; }
+  else
+    echo "缺少 sha256sum 或 shasum，无法校验安装包" >&2
+    exit 1
   fi
-  echo "直接运行："
-  echo "   smon                    # 中文实时进程表"
-  echo "   smon -m / -d / -n       # 按内存 / 磁盘IO / 网络 排序"
-  echo "   smon -j                 # 输出 JSON"
-  echo "   smon --serve             # 启动 Web 面板 http://<ip>:8080/"
-  echo "   smon -h                 # 帮助"
-else
-  echo "❌ 安装失败，校验未通过" >&2
-  rm -f "$INSTALL_DIR/smon" "$INSTALL_DIR/web.py"
-  exit 1
+  tar -xzf "$WORK_DIR/$ARCHIVE" -C "$WORK_DIR"
+  SOURCE_DIR="$WORK_DIR/smon-linux-$ARCH"
+  SMON_SOURCE="$SOURCE_DIR/smon"
 fi
+
+for required in "$SMON_SOURCE" "$SOURCE_DIR/smon-net" "$SOURCE_DIR/web.py" \
+  "$SOURCE_DIR/LICENSE" "$SOURCE_DIR/THIRD_PARTY_NOTICES"; do
+  [[ -f $required ]] || { echo "安装包缺少: $required" >&2; exit 1; }
+done
+
+DOC_DIR="${SMON_DOC_DIR:-$(dirname "$INSTALL_DIR")/share/doc/smon}"
+install -d -m 0755 "$INSTALL_DIR" "$DOC_DIR"
+install -m 0755 "$SMON_SOURCE" "$INSTALL_DIR/smon"
+install -m 0755 "$SOURCE_DIR/smon-net" "$INSTALL_DIR/smon-net"
+install -m 0644 "$SOURCE_DIR/web.py" "$INSTALL_DIR/smon-web.py"
+install -m 0644 "$SOURCE_DIR/LICENSE" "$DOC_DIR/LICENSE"
+install -m 0644 "$SOURCE_DIR/THIRD_PARTY_NOTICES" "$DOC_DIR/THIRD_PARTY_NOTICES"
+
+bash -n "$INSTALL_DIR/smon"
+"$INSTALL_DIR/smon-net" --version >/dev/null
+python3 -c "import ast; ast.parse(open('$INSTALL_DIR/smon-web.py', encoding='utf-8').read())"
+
+echo "smon 已安装到 $INSTALL_DIR"
+echo "完整进程网络归属请使用: sudo smon 或 sudo smon --serve"

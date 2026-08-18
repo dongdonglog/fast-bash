@@ -1,194 +1,411 @@
-# fast-bash · 中文进程占用实时排障工具
+# smon
 
-> 一打开就知道是谁占用了 CPU / 内存 / 磁盘 IO / 网络。
-> 以进程为核心，专为「出问题时快速定位」设计，纯 Bash、零依赖、开箱即用。
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-1793D1?logo=linux&logoColor=white)]()
+[![Arch: amd64%20%7C%20arm64](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-2F80ED)]()
+[![Go: 1.25](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)]()
+[![Release](https://img.shields.io/github/v/release/dongdonglog/fast-bash)](https://github.com/dongdonglog/fast-bash/releases/latest)
+[![Release assets](https://img.shields.io/github/downloads/dongdonglog/fast-bash/total)](https://github.com/dongdonglog/fast-bash/releases)
 
-## 为什么做这个
+> 一条命令看到 CPU、内存、磁盘 IO、网卡流量，以及**宿主机进程 + K3s Pod/容器** 的 TCP/UDP 收发速率和定位到 PID 的归属结论。
 
-排查服务器问题时，`top` / `htop` 数据全、但**英文、信息过载**；
-`glances` / `netdata` 又要装一堆依赖。
-`fast-bash` 的目标很朴素：**一条命令，打开就是一张按占用排序的中文进程表**，
-一眼看出是哪个进程在拖垮机器。
+`smon` 是一个面向 Linux 服务器的实时排障工具，专为回答这些问题而设计：
+
+- *这个口子到底是谁打的？落到哪个 Pod？*
+- *CPU/内存没炸，但磁盘 IO 在抖，是哪条容器写爆了？*
+- *网卡流量起来了，宿主进程和 K3s 容器各自的贡献是多少？*
+- *内存里 991 个僵尸进程，源头是哪个父进程？*
+
+**采集器** 用 Go 写的 `smon-net`（嵌 eBPF cgroup + `AF_PACKET/TPACKET_V3`，MIT），**呈现层** 用 Bash TUI 和纯 Python 3 标准库的 HTTP 面板；不需要 Node、不需要 React、不需要 Go runtime。Linux amd64 / arm64 静态发行包。
+
+---
+
+## 截图
+
+<details open>
+<summary><b>Web 面板 · 诊断、网络热点、磁盘设备、进程负载</b></summary>
+
+![smon Web 面板 - 概览、诊断结论、网络热点](docs/images/smon-web-overview.png)
+</details>
+
+<details>
+<summary><b>Web 面板 · 进程与工作负载列表（全部 / 宿主 / Pod 筛选）</b></summary>
+
+![smon Web 面板 - 进程与工作负载](docs/images/smon-web-processes.png)
+</details>
+
+---
+
+## 目录
+
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [使用](#使用)
+- [Web 面板](#web-面板)
+- [原理](#原理)
+- [JSON 接口](#json-接口)
+- [内部采集接口](#内部采集接口)
+- [平台与限制](#平台与限制)
+- [开发与测试](#开发与测试)
+- [项目结构](#项目结构)
+- [贡献](#贡献)
+- [许可](#许可)
+- [致谢](#致谢)
+
+---
+
+## 特性
+
+- **eBPF cgroup + AF_PACKET/TPACKET_V3** 双抓包，归属到 cgroup，再回查 `/proc` 解析出唯一 PID 或 Pod/容器；权限失败自动降级到 `ss -i`，不会把"采不到"解释成 0。
+- **磁盘块设备** 实时吞吐、IOPS、busy %、读写 await、队列深度；不依赖 `iostat`。
+- **结构化诊断结论** — 责任 PID/Pod、证据、磁盘根因和可复制的只读排查命令；点按钮只复制，不在服务器自动执行。
+- **三层呈现** — Bash TUI、JSON (`-j`)、Web 面板，三者消费同一份版本化的原子 TSV 快照。
+- **IPv4 / IPv6 / VLAN / QinQ** 全覆盖，unknown 分类（未匹配、shared socket、已退出、非 TCP/UDP）透明可见。
+- **静态离线发行包** — runtime 不需要 Go / Node / NetHogs / libpcap / ncurses；只依赖系统自带的 Python 3。
+- **K3s / 任意 cgroup v2** 场景开箱即用，不需要 Kubernetes API 凭据，也不调用运行时命令。
+
+---
 
 ## 快速开始
 
-**方式一：一键安装（推荐，需要 root）**
+完整模式需要 `root`（或具备 `CAP_BPF + CAP_NET_RAW` 权限）：
+
+```bash
+# 1. 在线安装（自动识别 amd64 / arm64，校验 SHA-256）
+curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
+
+# 2. 打开交互式 TUI
+sudo smon
+
+# 3. 一键 Web 面板
+sudo smon --serve 8080
+# 浏览器打开 http://<服务器IP>:8080/
+```
+
+> 一条命令离开前先确认本机能连通 [GitHub Releases](https://github.com/dongdonglog/fast-bash/releases)；断网/受限环境请使用下面的[离线安装](#离线安装)。
+
+### 在线安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
-
-# 安装后直接运行命令（不是 bash smon.sh）
-smon -h        # 先确认可用
 ```
 
-**方式二：克隆仓库，在仓库目录里直接跑**
+内网可指向镜像：
 
 ```bash
-git clone https://github.com/dongdonglog/fast-bash.git && cd fast-bash
-bash smon.sh   # 注意：只有在仓库目录内才能这么跑
+curl -fsSL http://mirror.example/smon/install.sh |
+  sudo SMON_BASE_URL=http://mirror.example/smon/releases bash
 ```
 
-> ⚠️ 安装后请使用 `smon` 命令。`bash smon.sh` 只在当前目录存在 smon.sh 时有效（即方式二的仓库目录）。
-> 若提示 `smon: command not found`，见文末「安装后无法运行」排查。
+### 离线安装
+
+```bash
+# 1. 在同架构的联网机器上下载
+#    smon-linux-amd64.tar.gz (含 .sha256) 或 smon-linux-arm64.tar.gz
+# 2. 拷贝到目标机后执行
+sha256sum -c smon-linux-<arch>.tar.gz.sha256
+tar -xzf smon-linux-<arch>.tar.gz
+cd smon-linux-<arch>
+sudo ./install.sh
+```
+
+资产齐全时 `install.sh` **不发起任何网络请求**；默认安装到 `/usr/local/bin/`，许可证和第三方声明到 `/usr/local/share/doc/smon/`。
+
+### 源码运行（macOS 也能跑）
+
+```bash
+# macOS：自动降级到 CPU / 内存视图
+bash smon.sh
+
+# Linux：在仓库根目录构建匹配的采集器
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o smon-net ./cmd/smon-net
+sudo ./smon.sh
+```
+
+Go 只用于构建，不是发布包的运行时依赖。
+
+---
 
 ## 使用
 
-```bash
-smon            # 实时进程表（默认按 CPU 排序，每 5 秒刷新）
-smon -m         # 按内存排序
-smon -d         # 按磁盘 IO 排序
-smon -n         # 按网络排序
-smon -i 1       # 刷新间隔改为 1 秒
-smon -j         # 输出一次 JSON（供脚本 / Web 面板对接）
-smon --json     # 同上（长选项）
-smon --serve    # 启动 Web 面板（浏览器可视化，默认 8080）
+```text
+smon                # 实时进程表，默认每 5 秒刷新
+smon -m             # 按内存排序
+smon -d             # 按磁盘 IO 排序
+smon -n             # 按进程网络收发排序
+smon -i 1           # 1 秒刷新
+smon -j             # 一次 JSON 采样（默认约 1 秒）
+smon --serve        # 启动 Web 面板，默认端口 8080
 smon --serve 9000   # 指定端口
-smon -h         # 帮助
 ```
 
-实时模式下快捷键：`c` 按 CPU、`m` 按内存、`d` 按磁盘 IO、`n` 按网络、`q` 退出。
+TUI 快捷键：
 
-## Web 面板（`--serve`）
+| 键 | 作用 |
+|----|------|
+| `c` | 按 CPU 排序 |
+| `m` | 按内存排序 |
+| `d` | 按磁盘 IO 排序 |
+| `n` | 按网络收发排序 |
+| `q` | 退出 |
 
-一条命令起一个本地 Web 可视化面板（需要 `python3`，Linux 服务器一般自带）：
+默认抓主路由网卡，可显式覆盖：
 
 ```bash
-smon --serve 8080
-# => smon Web 面板: http://0.0.0.0:8080/  (Ctrl+C 退出)
+sudo SMON_NETIF=eno1 smon -n
+sudo SMON_NETIF=eno1 smon --serve 8080
 ```
 
-浏览器打开 `http://<服务器IP>:8080/` 即可看到中文仪表盘：
+非 root / 采集器缺失 / 异常时会**自动降级**到 `ss -i`，TUI / JSON / Web 同步显示降级原因，绝不把漏采解释成准确的 0。
 
-- 顶部概况卡片：CPU / 内存 / 根分区 / **网络总收总发** / 进程数（带进度条，超高标红）
-- 下方完整进程表：支持点击表头排序、红黄高亮
-- 底部诊断建议（同 CLI 的异常告警）
-- 后台每 5 秒自动采样一次，前端每 5 秒刷新
+---
 
-> 原理：`smon --serve` 启动一个轻量 Python HTTP 服务器，后台线程持续调用 `smon -j` 缓存最新 JSON，`/api` 接口即时返回，浏览器零依赖（无 CDN）。
+## Web 面板
 
-## 界面
+`sudo smon --serve 8080`，打开 `http://<服务器IP>:8080/`。
 
-```
- 系统概况
-  主机: web-01 | 系统: Linux | 运行: up 3 days, 2 hours
-  CPU  32%   负载 1.2/0.8/0.6   内存  8400/16384MB   磁盘/ 3%
-  网络: ↓1.2MB/s  ↑0.3MB/s   (eth0)
+面板包含：
 
-PID       CPU%  内存   读IO   写IO 连接  收↓   发↑   用户     命令
-1234        45%   1.2G   8.4M   12M    12  2.1M  0.5M  app      java -jar gateway.jar
- 987         8%    48M   0.1M  0.2M    34     0     0  www-data nginx: worker process
- ...
-  [排序: cpu]  c=CPU  m=内存  d=磁盘IO  n=网络  q=退出
-  ⚠ 诊断建议
-    1分钟负载 9.5 超过核数(8)，疑似高并发或 IO 阻塞
-    根分区使用 92% 接近满，清理: du -sh /* 2>/dev/null | sort -rh | head
-```
+- **顶部指标卡** — CPU、内存、根分区、网卡总 RX/TX、对象数（含对象/Zombie 计数）。
+- **诊断结论** — 责任 PID/Pod、证据、根因、可复制的只读排查命令（一键复制）。
+- **网络热点** — 接收/发送最快的 5 个宿主进程或容器工作负载，以及顶层块设备指标；支持 `全部 / 宿主 / Pod` 筛选；无有效网络流量时整区隐藏。
+- **活跃磁盘设备** — `sda / dm-0` 等设备的读写吞吐、IOPS、busy、读写 await、队列深度。
+- **进程与工作负载** — 全量进程列表，附归属类型（socket / cgroup / 已退出 / unknown）。
 
-- **进程主导**：下方全部是进程，按占用排序，一眼定位"谁在吃资源"。
-- **占用高亮**：占用 ≥90% 标红加粗、≥60% 标黄、正常绿色。
-- **诊断建议**：检测到 CPU/内存/负载/磁盘/IO/网络异常时，自动给出中文排查命令。
-- 顶部一行系统概况：CPU、负载、内存、根分区使用率、**总收/总发流量**（接口级，始终可靠）。
-- **每进程带宽**：收↓/发↑ 来自内核 `ss -i`(TCP_INFO) 每连接字节计数器，**纯内置**。
+Python 后端长期运行一个 `smon-net` 实例、每秒更新一次内存缓存；**采集器崩溃自动重启**，恢复前所有接口会显示降级原因。
 
-## 数据来源与说明
+实现细节：
 
-| 指标 | Linux 数据来源 | 说明 |
-|------|---------------|------|
-| CPU% | `/proc/<pid>/stat`（间隔采样差值） | 单核百分比，100% = 吃满一核 |
-| 内存 | `/proc/<pid>/status` 的 VmRSS | 精确物理内存占用 |
-| 磁盘 IO | `/proc/<pid>/io`（读写字节差值） | **需要 root** 才能读其他用户进程 |
-| 网络连接数 | `ss -p` 统计每进程 TCP/UDP 连接数 | 无需 root 即可统计 |
-| 网络总流量 | `/proc/net/dev` 差值 | **始终可靠**，无需 root，显示 总收/总发 |
-| 每进程连接数 | `ss -p` 统计 TCP/UDP 连接 | root 才完整（非 root 只统计自身） |
-| 每进程带宽 | `ss -iepn` 的 TCP_INFO 字节计数器差值 | **纯内置**，无需 nethogs/eBPF；仅 TCP（UDP/QUIC 无计数器），root 才完整 |
+- 复制按钮在普通 HTTP 内网场景走兼容模式，不依赖 HTTPS Clipboard API；浏览器完全禁止自动复制时会显示带完整命令的手动复制框。
+- 进程命令、用户名、告警、错误文本在插入 HTML 前 **统一转义**。
+- 诊断结论的"查看父进程""查看进程 IO"等按钮只复制命令，不会在服务器上自动执行。
 
-> **网络数据全部纯内置，零外部工具**：① 总收/总发（接口级，永远可靠，无需 root）② 每进程连接数（ss -p）
-> ③ 每进程 TCP 带宽（`ss -i` 内核每连接字节计数器，如 `bytes_acked`/`bytes_received` 的差值）。
-> 这正是大多数开源工具不做、而 smon 用内置数据源做到的「每进程带宽」。
+---
 
-### JSON 输出（`-j` / `--json`）
+## 原理
 
-供脚本、CI、Web 面板对接的一次性采样，结构：
+`smon-net` 是一个独立的 MIT 代码，使用了与 NetHogs 同类的公开 Linux 接口，但**没有复制任何 GPLv2+ 源码**（见 `THIRD_PARTY_NOTICES`）。
+
+数据流：
+
+1. 嵌入的 **cgroup-skb eBPF 程序** 按 cgroup ID、IPv4/IPv6、TCP/UDP tuple 和方向累计字节。
+2. `AF_PACKET/TPACKET_V3` 同时给出选定网卡的总量、报文数和 drop；eBPF 加载失败自动回退。
+3. 扫描所有进程的 **cgroup、network namespace、socket fd** 与对应的 `/proc/<pid>/net/*`，把唯一 socket owner 关联回 PID。
+4. 从 `cri-containerd-*.scope`、`/var/log/containers`、`/var/log/pods` 解析 namespace / Pod / container；**不调用 Kubernetes API**，也不调 `kubectl` / `crictl`。
+5. 唯一 owner → PID；共享 socket / 短连接 / 多进程容器 → 归到真实 Pod/容器汇总；拿不到 cgroup 元数据 → `unknown`。
+6. Bash TUI / JSON / Python Web 都消费同一份 **版本化的 v3 原子 TSV 快照**。
+
+明确不猜测 PID 的场景（落入 `unknown`）：
+
+- 同一 socket 被多个进程共享
+- `SO_REUSEPORT` 导致同一 tuple 有多个候选 inode
+- 连接太短，`/proc` 扫描前已消失
+- 进程退出或 PID `start_ticks` 发生变化（防止 PID 复用误判）
+- 非 TCP/UDP 报文、分片后续报文或无法解析的报文
+- 纯转发 + 缺少 cgroup 元数据；**这类流量不会记成 `k3s server`**
+
+进程/容器速率按 eBPF 看到的 `skb->len` 统计（≠ 应用 payload），网卡总量来自选定接口的 `/proc/net/dev`；二者分别表示 cgroup 工作负载活动和物理接口活动，归属覆盖率按本轮可见流量中的 *已归属 / unknown* 计算。
+
+---
+
+## JSON 接口
+
+保留历史字段 `processes[].recv_kbs` / `sent_kbs`，新增 `net_attribution` 块：
 
 ```json
 {
-  "host": "web-01",
-  "os": "Linux 6.1.0",
-  "cpu": { "percent": 32, "load1": 1.2, "load5": 0.8, "load15": 0.6 },
-  "memory": { "total_mb": 16384, "used_mb": 8400, "percent": 51 },
-  "disk_root_percent": 3,
-  "privileged": 1,
-  "netif": "eth0",
-  "net_traffic": { "rx_kbs": 1234, "tx_kbs": 89 },
+  "netif": "eno1",
+  "net_traffic": { "rx_kbs": 8421, "tx_kbs": 1200 },
+  "net_attribution": {
+    "source": "ebpf_cgroup",
+    "status": "ok",
+    "scope": "host_and_containers",
+    "protocols": ["tcp", "udp"],
+    "interval_ms": 1000,
+    "attributed_percent": 96,
+    "unknown_rx_kbs": 120,
+    "unknown_tx_kbs": 20,
+    "unknown_breakdown": {
+      "unsupported_rx_kbs": 0, "unsupported_tx_kbs": 0,
+      "unmatched_rx_kbs": 110, "unmatched_tx_kbs": 15,
+      "ambiguous_rx_kbs": 5, "ambiguous_tx_kbs": 5,
+      "exited_rx_kbs": 5, "exited_tx_kbs": 0
+    },
+    "captured_packets": 12345,
+    "dropped_packets": 0,
+    "reason": ""
+  },
   "processes": [
-    { "pid": 1234, "cpu": 45, "rss_mb": 1228, "read_kbs": 8600,
-      "write_kbs": 12200, "net": 12, "user": "app", "cmd": "java -jar gateway.jar" }
+    {
+      "pid": 1234,
+      "user": "app",
+      "cmd": "java -jar gateway.jar --profile prod",
+      "recv_kbs": 8100,
+      "sent_kbs": 980,
+      "scope": "pod",
+      "namespace": "moying-business",
+      "pod": "scene-hub-service-54dbcb7cb8-6wkpr",
+      "container": "scene-hub-service",
+      "container_id": "126efda...",
+      "attribution": "socket"
+    }
   ],
-  "alerts": [ "根分区使用 92% 接近满，清理: du -sh /* 2>/dev/null | sort -rh | head" ]
+  "network_entities": [
+    {
+      "kind": "container",
+      "pid": null,
+      "namespace": "moying-business",
+      "pod": "scene-hub-service-54dbcb7cb8-6wkpr",
+      "container": "scene-hub-service",
+      "cmd": "container aggregate",
+      "recv_kbs": 820,
+      "sent_kbs": 140,
+      "attribution": "cgroup"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "warning",
+      "resource": "disk",
+      "summary": "设备 sda 出现写等待，主要责任 Pod 为 ...",
+      "evidence": ["busy 91%", "write await 42ms"],
+      "suspects": [{ "kind": "pod", "namespace": "moying-business", "pod": "..." }],
+      "actions": [{ "label": "查看 Pod", "command": "k3s kubectl -n moying-business get pod ... -o wide" }]
+    }
+  ]
 }
 ```
 
-```bash
-smon -j | python3 -m json.tool     # 校验并美化
+`disk_devices` 提供顶层块设备的吞吐 / IOPS / busy / await / 队列深度——**不会把分区与父设备重复相加**。
+
+降级态：
+
+```json
+{
+  "source": "ss_tcp_info",
+  "status": "partial",
+  "protocols": ["tcp"],
+  "reason": "AF_PACKET 权限不足，请使用 sudo smon"
+}
 ```
 
-### 阈值说明
+校验输出：
 
-- 高亮：CPU / 内存 / 磁盘 / 网络占用 ≥90% 红、≥60% 黄（磁盘按绝对速率 50MB/s / 10MB/s，网络连接 500 / 200）。
-- 诊断触发：CPU≥90%、内存≥90%、负载>核数、根分区≥85%、磁盘读≥50MB/s、网络连接≥500。
+```bash
+smon -j | python3 -m json.tool
+```
 
-## 平台兼容
+---
 
-**Linux（主要目标）**：完整能力 —— 每进程 CPU% / 内存 / 磁盘 IO / 网络（总流量 + 连接数 + 每进程 TCP 带宽）、
-诊断建议、Web 面板。磁盘 IO、连接数、每进程带宽需 root 才完整。
+## 内部采集接口
 
-**macOS**：没有 `/proc`，自动降级为 `ps` 采集，**提供 CPU% 和内存**（系统概况含内存/负载），
-每进程磁盘 IO 与网络数据为 `0`，Web 面板与 `-j` JSON 正常可用。
+`smon-net` 输出一个版本化的原子 TSV 快照，供 Bash / Web 消费：
 
-> 两平台均支持：实时进程表、排序、占用高亮、系统概况、诊断建议、`-j` JSON、`--serve` Web 面板。
-> 差异仅在「每进程磁盘 IO / 网络」这类依赖 Linux `/proc` / `ss` 的指标。
+```bash
+smon-net --interface eno1 --interval 1s --output /run/smon/net.tsv [--once]
+```
 
-## 常见问题
+快照权限 `0600`，通过同目录临时文件 + `fsync` + rename 原子替换。格式版本 **v3**（Bash 同时兼容旧的 v1 / v2）：
 
-**安装后运行 `smon` 提示 `command not found`？**
+```text
+M<TAB>3<TAB>unix_ms<TAB>interval_ms<TAB>iface<TAB>captured_rx_kbs<TAB>captured_tx_kbs<TAB>unknown_rx_kbs<TAB>unknown_tx_kbs<TAB>packets<TAB>drops<TAB>unsupported_rx_kbs<TAB>unsupported_tx_kbs<TAB>unmatched_rx_kbs<TAB>unmatched_tx_kbs<TAB>ambiguous_rx_kbs<TAB>ambiguous_tx_kbs<TAB>exited_rx_kbs<TAB>exited_tx_kbs<TAB>source<TAB>status<TAB>scope<TAB>reason
+P<TAB>pid<TAB>start_ticks<TAB>recv_kbs<TAB>sent_kbs<TAB>scope<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>attribution
+C<TAB>cgroup_id<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>recv_kbs<TAB>sent_kbs<TAB>attribution
+```
 
-1. 确认已装到哪：`ls -l /usr/local/bin/smon`
-2. 确认该目录在 PATH：`echo $PATH | tr ':' '\n' | grep usr/local/bin`
-   - 苹果芯片(M1/M2/M3)的 macOS 若 `/usr/local/bin` 不在 PATH，可改用：
-     `sudo INSTALL_DIR=/opt/homebrew/bin bash install.sh`（或用 `brew`）
-3. 临时生效：`export PATH="/usr/local/bin:$PATH"`，再试 `smon -h`
+---
 
-**`bash smon.sh: No such file or directory`？**
+## 平台与限制
 
-那是没在仓库目录里跑。安装后请直接用 `smon`；想用文件方式运行，先 `cd` 到有 `smon.sh` 的目录。
+| 平台 | 能力 |
+|------|------|
+| Linux 5.15+ · cgroup v2 · amd64 / arm64 · root | 宿主进程 + K3s Pod/容器 IPv4/IPv6 TCP/UDP；eBPF 加载失败自动回退 |
+| Linux · 非 root / 无 `CAP_NET_RAW` | 自动降级为部分 TCP（`ss -i`） |
+| macOS | CPU / 内存 / 系统概况；进程磁盘与网络不可用，需 root 跑完整 Linux |
+
+完整模式覆盖宿主机 cgroup v2 下的 Pod/容器；唯一 socket owner 才显示 PID，多进程共享 socket 显示容器汇总。纯转发和缺 cgroup 元数据的流量保留 unknown，**不会错误记到 `k3s server`**。
+
+项目不会自动给 `smon-net` 设置 capabilities；希望完整采集请直接 `sudo smon`。
+
+---
+
+## 开发与测试
+
+需要 Go 1.25。
+
+```bash
+# 静态测试
+go test ./...
+bash -n smon.sh install.sh
+shellcheck smon.sh install.sh
+python3 -m py_compile web.py
+
+# 跨架构构建
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/smon-net-amd64 ./cmd/smon-net
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/smon-net-arm64 ./cmd/smon-net
+```
+
+测试覆盖范围：
+
+- IPv4 / IPv6 · VLAN · TCP / UDP
+- 跨 netns 的 `/proc` 映射
+- Pod 元数据 · 共享 socket · 容器级 fallback
+- `unknown` 分类 · PID 复用 · 快照 v3 兼容性
+
+Linux root 集成测试：`tests/linux-root-integration.sh`。
+
+10 分钟资源门槛测试（要求 workload ≥ 时长 95%，采集器平均 CPU ≤ ½ 核、RSS ≤ 64 MB、drop = 0；1500 字节 / 1 Gbit/s 由传入发流命令保证）：
+
+```bash
+sudo SMON_PERF_SECONDS=600 tests/linux-performance.sh eno1 -- \
+  iperf3 -c PEER -t 600
+```
+
+### Release
+
+Git tag `v*` 触发 `.github/workflows/` 构建：
+
+- `smon-linux-amd64.tar.gz` · `smon-linux-arm64.tar.gz`
+- 每个压缩包的 `.sha256` 与总 `SHA256SUMS`
+
+每个离线包内容：`smon`、`smon-net`、`web.py`、`install.sh`、`LICENSE`、`THIRD_PARTY_NOTICES`、包内 `SHA256SUMS`。
+
+---
 
 ## 项目结构
 
-```
+```text
 fast-bash/
-├── smon.sh       # 主脚本（CLI 中文进程表 + JSON + --serve 启动 Web）
-├── web.py        # Web 面板：Python HTTP 服务器 + 内嵌前端（--serve 调用）
-├── install.sh    # curl 一键安装到 /usr/local/bin
-└── README.md
+├── cmd/smon-net/          # Go 采集器入口
+├── internal/netmon/       # 报文解析、/proc 归属、聚合、快照生成
+├── tests/                 # Linux root 集成测试与 10 分钟性能门槛
+├── smon.sh                # Bash TUI / JSON / Web 启动入口
+├── web.py                 # Python HTTP 服务与内嵌前端
+├── install.sh             # 本地优先的在线 / 离线安装器
+├── docs/images/           # README 引用的截图
+├── THIRD_PARTY_NOTICES    # 第三方依赖许可证声明
+└── .github/workflows/     # CI 与双架构 release
 ```
 
-## 开发
+---
 
-```bash
-# 语法与静态检查
-bash -n smon.sh
-shellcheck smon.sh        # 0 警告
+## 贡献
 
-# 本地试跑（macOS 走降级分支）
-bash smon.sh
-```
+欢迎 issue 与 PR。建议先开 issue 同步设计意图，再提代码。
 
-## 计划
+- **Bug 报告** — 带上 `smon --version`、`uname -a`、问题现象和最小复现步骤；Web 相关问题附浏览器版本。
+- **新指标 / 新接口** — 先讨论监控目标和 JSON 字段兼容性策略，避免破坏 v3 快照格式。
+- **PR** — 保持 Go 模块、Shell 脚本、Python 各自保持原有风格；新功能请附带测试用例。
 
-- [ ] 自定义阈值配置（环境变量 / 配置文件）
-- [ ] 远程批量监控多台服务器
-- [ ] 发布到 GitHub Actions 自动构建 / shellcheck
+---
 
 ## 许可
 
-MIT
+项目代码以 [MIT](LICENSE) 协议发布。`cilium/ebpf`（Apache-2.0）、`gopacket`（BSD-3-Clause）等依赖声明见 [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES)。
+
+---
+
+## 致谢
+
+- `cilium/ebpf`、`gopacket` — eBPF 与报文解析。
+- [NetHogs](https://github.com/raboof/nethogs) — 公开接口设计的参照；本项目为独立的 MIT 实现，未包含其 GPLv2+ 源码。
