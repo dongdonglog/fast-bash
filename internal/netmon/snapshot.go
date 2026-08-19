@@ -45,7 +45,10 @@ func WriteSnapshot(path string, snapshot Snapshot) error {
 	for _, process := range snapshot.Processes {
 		format := "P\t%d\t%d\t%d\t%d"
 		args := []any{process.PID, process.StartTicks, process.RXKBS, process.TXKBS}
-		if snapshot.Version >= 3 {
+		if snapshot.Version >= 4 {
+			format += "\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
+			args = append(args, cleanTSV(process.Scope), cleanTSV(process.Runtime), cleanTSV(process.Namespace), cleanTSV(process.Pod), cleanTSV(process.Container), cleanTSV(process.ContainerID), cleanTSV(process.Attribution))
+		} else if snapshot.Version >= 3 {
 			format += "\t%s\t%s\t%s\t%s\t%s\t%s"
 			args = append(args, cleanTSV(process.Scope), cleanTSV(process.Namespace), cleanTSV(process.Pod), cleanTSV(process.Container), cleanTSV(process.ContainerID), cleanTSV(process.Attribution))
 		}
@@ -56,10 +59,26 @@ func WriteSnapshot(path string, snapshot Snapshot) error {
 	}
 	sort.Slice(snapshot.Entities, func(i, j int) bool { return snapshot.Entities[i].CgroupID < snapshot.Entities[j].CgroupID })
 	for _, entity := range snapshot.Entities {
-		if _, err := fmt.Fprintf(w, "C\t%d\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n", entity.CgroupID,
-			cleanTSV(entity.Namespace), cleanTSV(entity.Pod), cleanTSV(entity.Container), cleanTSV(entity.ContainerID), entity.RXKBS, entity.TXKBS, cleanTSV(entity.Attribution)); err != nil {
+		format := "C\t%d\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n"
+		args := []any{entity.CgroupID, cleanTSV(entity.Namespace), cleanTSV(entity.Pod), cleanTSV(entity.Container), cleanTSV(entity.ContainerID), entity.RXKBS, entity.TXKBS, cleanTSV(entity.Attribution)}
+		if snapshot.Version >= 4 {
+			format = "C\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n"
+			args = []any{entity.CgroupID, cleanTSV(entity.Scope), cleanTSV(entity.Runtime), cleanTSV(entity.Namespace), cleanTSV(entity.Pod), cleanTSV(entity.Container), cleanTSV(entity.ContainerID), entity.RXKBS, entity.TXKBS, cleanTSV(entity.Attribution)}
+		}
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
 			_ = tmp.Close()
 			return err
+		}
+	}
+	if snapshot.Version >= 4 {
+		sort.Slice(snapshot.Workloads, func(i, j int) bool { return snapshot.Workloads[i].CgroupID < snapshot.Workloads[j].CgroupID })
+		for _, workload := range snapshot.Workloads {
+			if _, err := fmt.Fprintf(w, "W\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workload.CgroupID,
+				cleanTSV(workload.Scope), cleanTSV(workload.Runtime), cleanTSV(workload.Namespace), cleanTSV(workload.Pod), cleanTSV(workload.Container),
+				cleanTSV(workload.ContainerID), cleanTSV(workload.CgroupPath), cleanTSV(workload.Attribution)); err != nil {
+				_ = tmp.Close()
+				return err
+			}
 		}
 	}
 	if err := w.Flush(); err != nil {

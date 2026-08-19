@@ -17,6 +17,38 @@ func TestParseContainerMetadata(t *testing.T) {
 	}
 }
 
+func TestParseContainerCgroupRuntimes(t *testing.T) {
+	tests := []struct {
+		path, runtime, id, pod string
+	}{
+		{"/system.slice/docker-aaaaaaaaaaaa.scope", "docker", "aaaaaaaaaaaa", ""},
+		{"/machine.slice/libpod-bbbbbbbbbbbb.scope", "podman", "bbbbbbbbbbbb", ""},
+		{"/kubepods.slice/kubepods-pod01234567_89ab_cdef_0123_456789abcdef.slice/crio-cccccccccccc.scope", "cri-o", "cccccccccccc", "01234567-89ab-cdef-0123-456789abcdef"},
+		{"/docker/dddddddddddd", "docker", "dddddddddddd", ""},
+		{"/docker/dddddddddddd/inside.service", "docker", "dddddddddddd", ""},
+		{"/kubepods/burstable/pod01234567-89ab-cdef-0123-456789abcdef/eeeeeeeeeeee", "cri", "eeeeeeeeeeee", "01234567-89ab-cdef-0123-456789abcdef"},
+	}
+	for _, test := range tests {
+		info, ok := ParseContainerCgroupInfo(test.path)
+		if !ok || info.Runtime != test.runtime || info.ContainerID != test.id || info.PodUID != test.pod {
+			t.Errorf("ParseContainerCgroupInfo(%q) = %+v, %v", test.path, info, ok)
+		}
+	}
+}
+
+func TestCustomCgroupLayoutRequiresKnownMetadata(t *testing.T) {
+	id := "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+	catalog := WorkloadCatalog{items: map[string]Workload{id: {Runtime: "custom-cri", ContainerID: id, Container: "api", Scope: "container"}}}
+	workload := workloadForPath(7, "/tenant/workloads/"+id+"/inside.service", nil, nil, catalog)
+	if workload.Runtime != "custom-cri" || workload.Container != "api" || workload.Scope != "container" || workload.CgroupPath != "/tenant/workloads/"+id {
+		t.Fatalf("known custom runtime was not resolved: %+v", workload)
+	}
+	unknown := workloadForPath(8, "/tenant/workloads/0123456789abcdef", nil, nil, WorkloadCatalog{})
+	if unknown.IsContainer() || unknown.Scope != "host" {
+		t.Fatalf("unknown hex cgroup must stay host: %+v", unknown)
+	}
+}
+
 func TestSystemResolverUsesPIDOrContainerAggregate(t *testing.T) {
 	flow := FlowKey{Protocol: ProtocolTCP, Local: netip.MustParseAddrPort("10.42.0.8:8080"), Remote: netip.MustParseAddrPort("10.42.0.1:50000")}
 	process := ProcessID{PID: 123, StartTicks: 456}

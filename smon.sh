@@ -169,7 +169,7 @@ read_io() {  # $1=pid -> $IO_R $IO_W
   local pid=$1 s
   IO_R=0; IO_W=0
   [[ -r "/proc/$pid/io" ]] || return 0
-  IFS= read -rd '' s <"/proc/$pid/io" || true
+  IFS= read -rd '' s 2>/dev/null <"/proc/$pid/io" || true
   [[ $s == *read_bytes:* ]] || return 0
   s=${s#*read_bytes:}; IO_R=${s%%$'\n'*}; IO_R=${IO_R//[!0-9]/}
   [[ $s == *write_bytes:* ]] || return 0
@@ -210,11 +210,11 @@ ss_bw() {  # 输出 "pid bytes_acked bytes_received"（TCP 每连接累计字节
 
 # ------------------------- 每进程网络归属 -------------------------
 if [[ $OS == linux ]]; then
-  declare -A AF_RX AF_TX AF_START AF_SCOPE AF_NAMESPACE AF_POD AF_CONTAINER AF_CONTAINER_ID AF_ATTRIBUTION
-  declare -A WL_NAMESPACE WL_POD WL_CONTAINER
+  declare -A AF_RX AF_TX AF_START AF_SCOPE AF_RUNTIME AF_NAMESPACE AF_POD AF_CONTAINER AF_CONTAINER_ID AF_ATTRIBUTION
+  declare -A WL_SCOPE WL_RUNTIME WL_NAMESPACE WL_POD WL_CONTAINER WL_CGROUP_PATH
 else
-  declare -a AF_RX AF_TX AF_START AF_SCOPE AF_NAMESPACE AF_POD AF_CONTAINER AF_CONTAINER_ID AF_ATTRIBUTION
-  declare -a WL_NAMESPACE WL_POD WL_CONTAINER
+  declare -a AF_RX AF_TX AF_START AF_SCOPE AF_RUNTIME AF_NAMESPACE AF_POD AF_CONTAINER AF_CONTAINER_ID AF_ATTRIBUTION
+  declare -a WL_SCOPE WL_RUNTIME WL_NAMESPACE WL_POD WL_CONTAINER WL_CGROUP_PATH
 fi
 NET_ENTITIES=()
 NET_ATTR_SOURCE="ss_tcp_info"
@@ -309,8 +309,8 @@ ensure_net_collector() {
 }
 
 set_net_fallback() {
-  AF_RX=(); AF_TX=(); AF_START=(); AF_SCOPE=(); AF_NAMESPACE=(); AF_POD=(); AF_CONTAINER=(); AF_CONTAINER_ID=(); AF_ATTRIBUTION=()
-  WL_NAMESPACE=(); WL_POD=(); WL_CONTAINER=(); NET_ENTITIES=()
+  AF_RX=(); AF_TX=(); AF_START=(); AF_SCOPE=(); AF_RUNTIME=(); AF_NAMESPACE=(); AF_POD=(); AF_CONTAINER=(); AF_CONTAINER_ID=(); AF_ATTRIBUTION=()
+  WL_SCOPE=(); WL_RUNTIME=(); WL_NAMESPACE=(); WL_POD=(); WL_CONTAINER=(); WL_CGROUP_PATH=(); NET_ENTITIES=()
   NET_ATTR_SOURCE="ss_tcp_info"
   NET_ATTR_STATUS="partial"
   NET_ATTR_PROTOCOLS='["tcp"]'
@@ -337,20 +337,20 @@ set_net_fallback() {
 load_net_snapshot() {
   local kind version ts interval_ms iface cap_rx cap_tx unknown_rx unknown_tx packets drops
   local unsupported_rx unsupported_tx unmatched_rx unmatched_tx ambiguous_rx ambiguous_tx exited_rx exited_tx
-  local meta_source meta_status meta_scope meta_reason scope pid start rx tx now age max_age total attributed ns pod container cid attribution cgroup_id
+  local meta_source meta_status meta_scope meta_reason scope runtime pid start rx tx now age max_age total attributed ns pod container cid attribution cgroup_id cgroup_path
   set_net_fallback
   [[ $OS == linux ]] || return 1
   NET_SNAPSHOT=${SMON_NET_SNAPSHOT:-${NET_SNAPSHOT:-"$BASEDIR/net.tsv"}}
   [[ -r $NET_SNAPSHOT ]] || return 1
   IFS=$'\t' read -r kind version ts interval_ms iface cap_rx cap_tx unknown_rx unknown_tx packets drops unsupported_rx unsupported_tx unmatched_rx unmatched_tx ambiguous_rx ambiguous_tx exited_rx exited_tx meta_source meta_status meta_scope meta_reason <"$NET_SNAPSHOT" || return 1
-  [[ $kind == M && ( $version == 1 || $version == 2 || $version == 3 ) && $iface == "$NETIF" ]] || {
+  [[ $kind == M && ( $version == 1 || $version == 2 || $version == 3 || $version == 4 ) && $iface == "$NETIF" ]] || {
     NET_ATTR_REASON="smon-net 快照格式或网卡不匹配"
     return 1
   }
   for value in "$ts" "$interval_ms" "$cap_rx" "$cap_tx" "$unknown_rx" "$unknown_tx" "$packets" "$drops"; do
     [[ $value =~ ^[0-9]+$ ]] || { NET_ATTR_REASON="smon-net 快照字段无效"; return 1; }
   done
-  if [[ $version == 2 || $version == 3 ]]; then
+  if [[ $version == 2 || $version == 3 || $version == 4 ]]; then
     for value in "$unsupported_rx" "$unsupported_tx" "$unmatched_rx" "$unmatched_tx" "$ambiguous_rx" "$ambiguous_tx" "$exited_rx" "$exited_tx"; do
       [[ $value =~ ^[0-9]+$ ]] || { NET_ATTR_REASON="smon-net v2 分类字段无效"; return 1; }
     done
@@ -366,28 +366,54 @@ load_net_snapshot() {
     return 1
   fi
 
-  while IFS=$'\t' read -r kind pid start rx tx scope ns pod container cid attribution; do
-    if [[ $kind == P && $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ && $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]]; then
-      [[ $scope == - || -z $scope ]] && scope=host
-      [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution=""
-      AF_START[$pid]=$start; AF_RX[$pid]=$rx; AF_TX[$pid]=$tx; AF_SCOPE[$pid]=$scope
-      AF_NAMESPACE[$pid]=$ns; AF_POD[$pid]=$pod; AF_CONTAINER[$pid]=$container; AF_CONTAINER_ID[$pid]=$cid; AF_ATTRIBUTION[$pid]=$attribution
-      if [[ -n $cid ]]; then WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
-    fi
-  done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
-  if [[ $version == 3 ]]; then
+  if [[ $version == 4 ]]; then
+    while IFS=$'\t' read -r kind pid start rx tx scope runtime ns pod container cid attribution; do
+      if [[ $kind == P && $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ && $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]]; then
+        [[ $scope == - || -z $scope ]] && scope=host; [[ $runtime == - ]] && runtime=""
+        [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution=""
+        AF_START[$pid]=$start; AF_RX[$pid]=$rx; AF_TX[$pid]=$tx; AF_SCOPE[$pid]=$scope; AF_RUNTIME[$pid]=$runtime
+        AF_NAMESPACE[$pid]=$ns; AF_POD[$pid]=$pod; AF_CONTAINER[$pid]=$container; AF_CONTAINER_ID[$pid]=$cid; AF_ATTRIBUTION[$pid]=$attribution
+        if [[ -n $cid ]]; then WL_SCOPE[$cid]=$scope; WL_RUNTIME[$cid]=$runtime; WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
+      fi
+    done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
+  else
+    while IFS=$'\t' read -r kind pid start rx tx scope ns pod container cid attribution; do
+      if [[ $kind == P && $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ && $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]]; then
+        [[ $scope == - || -z $scope ]] && scope=host; runtime=""; [[ $scope == pod ]] && runtime=containerd
+        [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution=""
+        AF_START[$pid]=$start; AF_RX[$pid]=$rx; AF_TX[$pid]=$tx; AF_SCOPE[$pid]=$scope; AF_RUNTIME[$pid]=$runtime
+        AF_NAMESPACE[$pid]=$ns; AF_POD[$pid]=$pod; AF_CONTAINER[$pid]=$container; AF_CONTAINER_ID[$pid]=$cid; AF_ATTRIBUTION[$pid]=$attribution
+        if [[ -n $cid ]]; then WL_SCOPE[$cid]=$scope; WL_RUNTIME[$cid]=$runtime; WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
+      fi
+    done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
+  fi
+  if [[ $version == 4 ]]; then
+    while IFS=$'\t' read -r kind cgroup_id scope runtime ns pod container cid rx tx attribution; do
+      [[ $kind == C && $cgroup_id =~ ^[0-9]+$ && $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]] || continue
+      [[ $scope == - || -z $scope ]] && scope=container; [[ $runtime == - ]] && runtime=""
+      [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution="cgroup"
+      NET_ENTITIES+=("$cgroup_id"$'\t'"$scope"$'\t'"${runtime:--}"$'\t'"${ns:--}"$'\t'"${pod:--}"$'\t'"${container:--}"$'\t'"${cid:--}"$'\t'"$rx"$'\t'"$tx"$'\t'"${attribution:--}")
+      if [[ -n $cid ]]; then WL_SCOPE[$cid]=$scope; WL_RUNTIME[$cid]=$runtime; WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
+    done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
+    while IFS=$'\t' read -r kind cgroup_id scope runtime ns pod container cid cgroup_path attribution; do
+      [[ $kind == W && $cgroup_id =~ ^[0-9]+$ ]] || continue
+      [[ $scope == - || -z $scope ]] && scope=container; [[ $runtime == - ]] && runtime=""
+      [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $cgroup_path == - ]] && cgroup_path=""
+      if [[ -n $cid ]]; then WL_SCOPE[$cid]=$scope; WL_RUNTIME[$cid]=$runtime; WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; WL_CGROUP_PATH[$cid]=$cgroup_path; fi
+    done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
+  elif [[ $version == 3 ]]; then
     while IFS=$'\t' read -r kind cgroup_id ns pod container cid rx tx attribution; do
       [[ $kind == C && $cgroup_id =~ ^[0-9]+$ && $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]] || continue
       [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution="cgroup"
-      NET_ENTITIES+=("$cgroup_id"$'\t'"$ns"$'\t'"$pod"$'\t'"$container"$'\t'"$cid"$'\t'"$rx"$'\t'"$tx"$'\t'"$attribution")
-      if [[ -n $cid ]]; then WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
+      NET_ENTITIES+=("$cgroup_id"$'\t'"pod"$'\t'"containerd"$'\t'"${ns:--}"$'\t'"${pod:--}"$'\t'"${container:--}"$'\t'"${cid:--}"$'\t'"$rx"$'\t'"$tx"$'\t'"${attribution:--}")
+      if [[ -n $cid ]]; then WL_SCOPE[$cid]=pod; WL_RUNTIME[$cid]=containerd; WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container; fi
     done < <(tail -n +2 "$NET_SNAPSHOT" 2>/dev/null)
   fi
   total=$(( cap_rx + cap_tx ))
   attributed=$(( total - unknown_rx - unknown_tx )); (( attributed < 0 )) && attributed=0
   if (( total > 0 )); then NET_ATTR_PERCENT=$(( attributed * 100 / total )); else NET_ATTR_PERCENT=100; fi
   (( NET_ATTR_PERCENT > 100 )) && NET_ATTR_PERCENT=100
-  if [[ $version == 3 ]]; then
+  if [[ $version == 3 || $version == 4 ]]; then
     [[ $meta_source == - || -z $meta_source ]] && meta_source="af_packet_fallback"
     [[ $meta_status == - || -z $meta_status ]] && meta_status="partial"
     [[ $meta_scope == - || -z $meta_scope ]] && meta_scope="host_network_namespace"
@@ -448,6 +474,7 @@ load_workload_metadata() {
     [[ $cid =~ ^[0-9a-f]{12,64}$ && $prefix == *_*_* ]] || continue
     pod=${prefix%%_*}; rest=${prefix#*_}; ns=${rest%%_*}; container=${rest#*_}
     WL_NAMESPACE[$cid]=$ns; WL_POD[$cid]=$pod; WL_CONTAINER[$cid]=$container
+    WL_SCOPE[$cid]=pod
   done
 }
 
@@ -540,24 +567,50 @@ disk_devices_collect() {
 }
 
 cgroup_io_snapshot() {
-  [[ $OS == linux && -d /sys/fs/cgroup/kubepods.slice ]] || return 0
-  local file dir base cid r w value line
+  [[ $OS == linux && -d /sys/fs/cgroup ]] || return 0
+  local file dir base cid path r w value line found=0
   local -a fields
-  while IFS= read -r file; do
-    dir=${file%/io.stat}; base=${dir##*/}
-    [[ $base == cri-containerd-*.scope ]] || continue
-    cid=${base#cri-containerd-}; cid=${cid%.scope}; r=0; w=0
+  for cid in "${!WL_CGROUP_PATH[@]}"; do
+    path=${WL_CGROUP_PATH[$cid]}; [[ $path == /* && $path != *'..'* ]] || continue
+    file="/sys/fs/cgroup${path%/}/io.stat"; [[ -r $file ]] || continue
+    r=0; w=0
     while IFS= read -r line; do
       read -r -a fields <<<"$line"
       for value in "${fields[@]}"; do
         case $value in
-          rbytes=*) value=${value#rbytes=}; (( value > r )) && r=$value ;;
-          wbytes=*) value=${value#wbytes=}; (( value > w )) && w=$value ;;
+          rbytes=*) value=${value#rbytes=}; (( r += value )) ;;
+          wbytes=*) value=${value#wbytes=}; (( w += value )) ;;
         esac
       done
     done <"$file" 2>/dev/null
     printf '%s %d %d\n' "$cid" "$r" "$w"
-  done < <(find /sys/fs/cgroup/kubepods.slice -type f -name io.stat 2>/dev/null)
+    found=1
+  done
+  (( found )) && return 0
+
+  # v1-v3 快照兼容：识别常见 systemd/cgroupfs 容器叶子目录。
+  while IFS= read -r file; do
+    dir=${file%/io.stat}; base=${dir##*/}; cid=""
+    case $base in
+      cri-containerd-*.scope) cid=${base#cri-containerd-}; cid=${cid%.scope} ;;
+      crio-*.scope) cid=${base#crio-}; cid=${cid%.scope} ;;
+      docker-*.scope) cid=${base#docker-}; cid=${cid%.scope} ;;
+      libpod-*.scope) cid=${base#libpod-}; cid=${cid%.scope} ;;
+      [0-9a-f]*) [[ $dir == */kubepods/* || $dir == */docker/* || $dir == */libpod/* ]] && cid=$base ;;
+    esac
+    [[ $cid =~ ^[0-9a-f]{12,64}$ ]] || continue
+    r=0; w=0
+    while IFS= read -r line; do
+      read -r -a fields <<<"$line"
+      for value in "${fields[@]}"; do
+        case $value in
+          rbytes=*) value=${value#rbytes=}; (( r += value )) ;;
+          wbytes=*) value=${value#wbytes=}; (( w += value )) ;;
+        esac
+      done
+    done <"$file" 2>/dev/null
+    printf '%s %d %d\n' "$cid" "$r" "$w"
+  done < <(find /sys/fs/cgroup -type f -name io.stat 2>/dev/null)
 }
 
 CGROUP_IO=()
@@ -677,6 +730,39 @@ root_block_device() {
   printf '%s\t%s\n' "$current" "$chain"
 }
 
+SHELL_QUOTED=""; WORKLOAD_ACTIONS="[]"; WORKLOAD_PRIMARY_COMMAND=""
+shell_quote_value() {
+  printf -v SHELL_QUOTED '%q' "$1"
+}
+
+workload_actions() { # scope runtime namespace pod container_id
+  local scope=$1 runtime=$2 ns=$3 pod=$4 cid=$5 kube inspect qns qpod qcid first=""
+  WORKLOAD_ACTIONS="["; WORKLOAD_PRIMARY_COMMAND=""
+  if [[ $scope == pod && -n $pod ]]; then
+    if command -v kubectl >/dev/null 2>&1; then kube=kubectl
+    elif command -v k3s >/dev/null 2>&1; then kube="k3s kubectl"
+    elif command -v rke2 >/dev/null 2>&1; then kube="rke2 kubectl"
+    else kube=kubectl
+    fi
+    shell_quote_value "$ns"; qns=$SHELL_QUOTED; shell_quote_value "$pod"; qpod=$SHELL_QUOTED
+    WORKLOAD_PRIMARY_COMMAND="$kube -n $qns get pod $qpod -o wide"
+    WORKLOAD_ACTIONS+="{\"label\":\"查看 Pod\",\"command\":\"$(json_escape "$WORKLOAD_PRIMARY_COMMAND")\"}"
+    first=1
+  fi
+  if [[ -n $cid ]]; then
+    shell_quote_value "$cid"; qcid=$SHELL_QUOTED
+    case $runtime in
+      docker) inspect="docker inspect $qcid" ;;
+      podman) inspect="podman inspect $qcid" ;;
+      *) inspect="crictl inspect $qcid" ;;
+    esac
+    [[ -z $first ]] || WORKLOAD_ACTIONS+=","
+    WORKLOAD_ACTIONS+="{\"label\":\"查看容器信息\",\"command\":\"$(json_escape "$inspect")\"}"
+    [[ -n $WORKLOAD_PRIMARY_COMMAND ]] || WORKLOAD_PRIMARY_COMMAND=$inspect
+  fi
+  WORKLOAD_ACTIONS+="]"
+}
+
 collect_alerts() {  # 读取 collect 数据(stdin)，产出结构化 FINDINGS 与兼容 ALERTS
   ALERTS=(); FINDINGS=()
   local a pid cpu rss rk wk nc rx tx cmd bw io
@@ -731,11 +817,20 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出结构化 FINDINGS �
     [[ -z ${DEVICE_SEEN[$root]:-} ]] || continue; DEVICE_SEEN[$root]=1
     if (( wa >= 20 && wa >= ra )); then pattern="写等待"; elif (( dq >= 2 )); then pattern="队列堆积"; elif (( di + dj >= 1000 && dr + dw < (di + dj) * 64 )); then pattern="高并发小 IO"; else pattern="设备繁忙"; fi
     severity=warning; (( db >= 95 || ra >= 100 || wa >= 100 )) && severity=critical
-    local cgns=${WL_NAMESPACE[$topcg_id]:-} cgpod=${WL_POD[$topcg_id]:-} cgcontainer=${WL_CONTAINER[$topcg_id]:-}
-    if (( topcg > topio && topcg > 0 )) && [[ -n $cgns && -n $cgpod ]]; then
-      suspect="[{\"kind\":\"pod\",\"namespace\":\"$(json_escape "$cgns")\",\"pod\":\"$(json_escape "$cgpod")\",\"container\":\"$(json_escape "$cgcontainer")\",\"container_id\":\"$topcg_id\",\"read_kbs\":${topcg_r},\"write_kbs\":${topcg_w}}]"
-      actions="[{\"label\":\"查看 Pod\",\"command\":\"k3s kubectl -n ${cgns} get pod ${cgpod} -o wide\"},{\"label\":\"查看容器信息\",\"command\":\"crictl inspect ${topcg_id}\"}]"
-      summary="设备 ${root} 出现${pattern}，主要 IO 来自 ${cgns}/${cgpod}/${cgcontainer}"
+    local cgscope="" cgruntime="" cgns="" cgpod="" cgcontainer=""
+    if [[ -n $topcg_id ]]; then
+      cgscope=${WL_SCOPE[$topcg_id]:-}; cgruntime=${WL_RUNTIME[$topcg_id]:-}; cgns=${WL_NAMESPACE[$topcg_id]:-}; cgpod=${WL_POD[$topcg_id]:-}; cgcontainer=${WL_CONTAINER[$topcg_id]:-}
+    fi
+    if (( topcg > topio && topcg > 0 )) && [[ -n $cgscope ]]; then
+      workload_actions "$cgscope" "$cgruntime" "$cgns" "$cgpod" "$topcg_id"
+      actions=$WORKLOAD_ACTIONS
+      if [[ $cgscope == pod ]]; then
+        suspect="[{\"kind\":\"pod\",\"runtime\":\"$(json_escape "$cgruntime")\",\"namespace\":\"$(json_escape "$cgns")\",\"pod\":\"$(json_escape "$cgpod")\",\"container\":\"$(json_escape "$cgcontainer")\",\"container_id\":\"$topcg_id\",\"read_kbs\":${topcg_r},\"write_kbs\":${topcg_w}}]"
+        summary="设备 ${root} 出现${pattern}，主要 IO 来自 ${cgns}/${cgpod}/${cgcontainer}"
+      else
+        suspect="[{\"kind\":\"container\",\"runtime\":\"$(json_escape "$cgruntime")\",\"container\":\"$(json_escape "$cgcontainer")\",\"container_id\":\"$topcg_id\",\"read_kbs\":${topcg_r},\"write_kbs\":${topcg_w}}]"
+        summary="设备 ${root} 出现${pattern}，主要 IO 来自 ${cgruntime:-container}/${cgcontainer:-${topcg_id:0:12}}"
+      fi
     else
       suspect="[{\"kind\":\"process\",\"pid\":${topio_pid},\"read_kbs\":${topio_r},\"write_kbs\":${topio_w}}]"
       actions="[{\"label\":\"查看进程 IO\",\"command\":\"cat /proc/${topio_pid}/io\"},{\"label\":\"查看进程状态\",\"command\":\"ps -p ${topio_pid} -o pid,ppid,user,state,etime,%cpu,%mem,cmd\"}]"
@@ -744,10 +839,16 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出结构化 FINDINGS �
     add_finding "$severity" disk "$summary" "$suspect" "$actions" "设备链 ${chain}" "busy ${db}%" "读/写 await ${ra}/${wa}ms" "队列深度 ${dq}" "吞吐 ${dr}/${dw}KB/s，IOPS ${di}/${dj}"
   done
 
-  local entity _entity_id ens epod econtainer _ecid erx etx _eattr entity_bw=0 entity_desc="" entity_actions=""
+  local entity _entity_id escope eruntime ens epod econtainer _ecid erx etx _eattr entity_bw=0 entity_desc="" entity_actions="[]" entity_kind="container"
   for entity in "${NET_ENTITIES[@]}"; do
-    IFS=$'\t' read -r _entity_id ens epod econtainer _ecid erx etx _eattr <<<"$entity"
-    (( erx + etx > entity_bw )) && { entity_bw=$((erx+etx)); entity_desc="$ens/$epod/$econtainer"; entity_actions="k3s kubectl -n $ens get pod $epod -o wide"; }
+    IFS=$'\t' read -r _entity_id escope eruntime ens epod econtainer _ecid erx etx _eattr <<<"$entity"
+    [[ $eruntime == - ]] && eruntime=""; [[ $ens == - ]] && ens=""; [[ $epod == - ]] && epod=""; [[ $econtainer == - ]] && econtainer=""; [[ $_ecid == - ]] && _ecid=""
+    if (( erx + etx > entity_bw )); then
+      entity_bw=$((erx+etx)); entity_kind=container
+      if [[ $escope == pod ]]; then entity_desc="$ens/$epod/$econtainer"; entity_kind=pod
+      else entity_desc="${eruntime:-container}/${econtainer:-${_ecid:0:12}}"; fi
+      workload_actions "$escope" "$eruntime" "$ens" "$epod" "$_ecid"; entity_actions=$WORKLOAD_ACTIONS
+    fi
   done
   if (( entity_bw > topbw_kb )); then topbw_kb=$entity_bw; topbw_pid=0; fi
   if (( topbw_kb >= 10240 )); then
@@ -756,9 +857,9 @@ collect_alerts() {  # 读取 collect 数据(stdin)，产出结构化 FINDINGS �
       actions="[{\"label\":\"查看进程连接\",\"command\":\"nsenter -t ${topbw_pid} -n ss -tpn\"}]"
       summary="PID ${topbw_pid} 是网络带宽热点（${topbw_kb}KB/s）"
     else
-      suspect="[{\"kind\":\"pod\",\"workload\":\"$(json_escape "$entity_desc")\",\"total_kbs\":${topbw_kb}}]"
-      actions="[{\"label\":\"查看 Pod\",\"command\":\"$(json_escape "$entity_actions")\"}]"
-      summary="Pod ${entity_desc} 是网络带宽热点（${topbw_kb}KB/s）"
+      suspect="[{\"kind\":\"${entity_kind}\",\"workload\":\"$(json_escape "$entity_desc")\",\"total_kbs\":${topbw_kb}}]"
+      actions=$entity_actions
+      summary="${entity_desc} 是网络带宽热点（${topbw_kb}KB/s）"
     fi
     add_finding warning network "$summary" "$suspect" "$actions" "接收与发送合计 ${topbw_kb}KB/s" "归属来源 ${NET_ATTR_SOURCE}"
   fi
@@ -895,13 +996,14 @@ emit_json() {  # 从 stdin 读 collect 数据
   echo
   echo "  ],"
   echo "  \"processes\": ["
-  local first=1 a pid cpu rss rk wk nc u nm rx tx u2 nm2 pscope pns ppod pcontainer pcid pattribution
+  local first=1 a pid cpu rss rk wk nc u nm rx tx u2 nm2 pscope pruntime pns ppod pcontainer pcid pattribution
   while IFS=' ' read -r -a a; do
     num "${a[0]}"; pid=$NUMOUT; num "${a[1]}"; cpu=$NUMOUT; num "${a[2]}"; rss=$NUMOUT; num "${a[3]}"; rk=$NUMOUT; num "${a[4]}"; wk=$NUMOUT; num "${a[5]}"; nc=$NUMOUT; u=${a[6]:-}; num "${a[7]}"; rx=$NUMOUT; num "${a[8]}"; tx=$NUMOUT; nm="${a[*]:9}"
     json_escape_value "$u"; u2=$JSON_ESCAPED
     json_escape_value "$nm"; nm2=$JSON_ESCAPED
-    pscope=${AF_SCOPE[$pid]:-host}; pns=${AF_NAMESPACE[$pid]:-}; ppod=${AF_POD[$pid]:-}; pcontainer=${AF_CONTAINER[$pid]:-}; pcid=${AF_CONTAINER_ID[$pid]:-}; pattribution=${AF_ATTRIBUTION[$pid]:-}
+    pscope=${AF_SCOPE[$pid]:-host}; pruntime=${AF_RUNTIME[$pid]:-}; pns=${AF_NAMESPACE[$pid]:-}; ppod=${AF_POD[$pid]:-}; pcontainer=${AF_CONTAINER[$pid]:-}; pcid=${AF_CONTAINER_ID[$pid]:-}; pattribution=${AF_ATTRIBUTION[$pid]:-}
     json_escape_value "$pscope"; pscope=$JSON_ESCAPED
+    json_escape_value "$pruntime"; pruntime=$JSON_ESCAPED
     json_escape_value "$pns"; pns=$JSON_ESCAPED
     json_escape_value "$ppod"; ppod=$JSON_ESCAPED
     json_escape_value "$pcontainer"; pcontainer=$JSON_ESCAPED
@@ -909,23 +1011,34 @@ emit_json() {  # 从 stdin 读 collect 数据
     json_escape_value "$pattribution"; pattribution=$JSON_ESCAPED
     (( first )) || echo ","
     first=0
-    printf '    { "kind": "process", "pid": %s, "scope": "%s", "namespace": "%s", "pod": "%s", "container": "%s", "container_id": "%s", "attribution": "%s", "cpu": %s, "rss_mb": %s, "read_kbs": %s, "write_kbs": %s, "net": %s, "user": "%s", "cmd": "%s", "recv_kbs": %s, "sent_kbs": %s}' \
-      "$pid" "$pscope" "$pns" "$ppod" "$pcontainer" "$pcid" "$pattribution" \
+    printf '    { "kind": "process", "pid": %s, "scope": "%s", "runtime": "%s", "namespace": "%s", "pod": "%s", "container": "%s", "container_id": "%s", "attribution": "%s", "cpu": %s, "rss_mb": %s, "read_kbs": %s, "write_kbs": %s, "net": %s, "user": "%s", "cmd": "%s", "recv_kbs": %s, "sent_kbs": %s}' \
+      "$pid" "$pscope" "$pruntime" "$pns" "$ppod" "$pcontainer" "$pcid" "$pattribution" \
       "$cpu" "$(( rss / 1024 ))" "$rk" "$wk" "$nc" "$u2" "$nm2" "$rx" "$tx"
   done <<<"$data"
   profile_mark emit_processes_written
   echo
   echo "  ],"
   echo "  \"network_entities\": ["
-  if [[ $OS == linux ]]; then declare -A CGROUP_RK CGROUP_WK; else declare -a CGROUP_RK CGROUP_WK; fi
-  local cgline cgid cgr cgw entity ns pod container cid erx etx attribution first_entity=1
+  if [[ $OS == linux ]]; then declare -A CGROUP_RK CGROUP_WK ENTITY_SEEN; else declare -a CGROUP_RK CGROUP_WK ENTITY_SEEN; fi
+  local cgline cgid cgr cgw entity scope runtime ns pod container cid erx etx attribution first_entity=1 io_r io_w
   for cgline in "${CGROUP_IO[@]}"; do IFS=$'\t' read -r cgid cgr cgw <<<"$cgline"; CGROUP_RK[$cgid]=$cgr; CGROUP_WK[$cgid]=$cgw; done
   for entity in "${NET_ENTITIES[@]}"; do
-    IFS=$'\t' read -r cgid ns pod container cid erx etx attribution <<<"$entity"
+    IFS=$'\t' read -r cgid scope runtime ns pod container cid erx etx attribution <<<"$entity"
+    [[ $runtime == - ]] && runtime=""; [[ $ns == - ]] && ns=""; [[ $pod == - ]] && pod=""; [[ $container == - ]] && container=""; [[ $cid == - ]] && cid=""; [[ $attribution == - ]] && attribution="cgroup"
+    io_r=0; io_w=0
+    if [[ -n $cid ]]; then io_r=${CGROUP_RK[$cid]:-0}; io_w=${CGROUP_WK[$cid]:-0}; ENTITY_SEEN[$cid]=1; fi
     (( first_entity )) || echo ','; first_entity=0
-    printf '    { "kind": "container", "pid": null, "scope": "pod", "namespace": "%s", "pod": "%s", "container": "%s", "container_id": "%s", "attribution": "%s", "cpu": 0, "rss_mb": 0, "read_kbs": %d, "write_kbs": %d, "net": 0, "user": "", "cmd": "container aggregate", "recv_kbs": %d, "sent_kbs": %d }' \
-      "$(json_escape "$ns")" "$(json_escape "$pod")" "$(json_escape "$container")" "$(json_escape "$cid")" "$(json_escape "$attribution")" \
-      "${CGROUP_RK[$cid]:-0}" "${CGROUP_WK[$cid]:-0}" "$erx" "$etx"
+    printf '    { "kind": "container", "pid": null, "scope": "%s", "runtime": "%s", "namespace": "%s", "pod": "%s", "container": "%s", "container_id": "%s", "attribution": "%s", "cpu": 0, "rss_mb": 0, "read_kbs": %d, "write_kbs": %d, "net": 0, "user": "", "cmd": "container aggregate", "recv_kbs": %d, "sent_kbs": %d }' \
+      "$(json_escape "$scope")" "$(json_escape "$runtime")" "$(json_escape "$ns")" "$(json_escape "$pod")" "$(json_escape "$container")" "$(json_escape "$cid")" "$(json_escape "$attribution")" \
+      "$io_r" "$io_w" "$erx" "$etx"
+  done
+  for cgline in "${CGROUP_IO[@]}"; do
+    IFS=$'\t' read -r cid cgr cgw <<<"$cgline"
+    [[ -z ${ENTITY_SEEN[$cid]:-} && -n ${WL_SCOPE[$cid]:-} ]] || continue
+    scope=${WL_SCOPE[$cid]:-container}; runtime=${WL_RUNTIME[$cid]:-}; ns=${WL_NAMESPACE[$cid]:-}; pod=${WL_POD[$cid]:-}; container=${WL_CONTAINER[$cid]:-}
+    (( first_entity )) || echo ','; first_entity=0
+    printf '    { "kind": "container", "pid": null, "scope": "%s", "runtime": "%s", "namespace": "%s", "pod": "%s", "container": "%s", "container_id": "%s", "attribution": "cgroup", "cpu": 0, "rss_mb": 0, "read_kbs": %d, "write_kbs": %d, "net": 0, "user": "", "cmd": "container aggregate", "recv_kbs": 0, "sent_kbs": 0 }' \
+      "$(json_escape "$scope")" "$(json_escape "$runtime")" "$(json_escape "$ns")" "$(json_escape "$pod")" "$(json_escape "$container")" "$(json_escape "$cid")" "$cgr" "$cgw"
   done
   echo
   echo "  ],"

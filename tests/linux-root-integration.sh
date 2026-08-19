@@ -165,9 +165,9 @@ assert_endpoint_rate() {
 assert_endpoint_rate TCP "$tcp_pid" "$server_pid"
 assert_endpoint_rate UDP "$udp_pid" "$server_pid"
 
-# shellcheck disable=SC2034 # Read every v3 field to validate its column position.
+# shellcheck disable=SC2034 # Read every metadata field to validate its column position.
 IFS=$'\t' read -r kind version _ interval_ms iface cap_rx cap_tx unknown_rx unknown_tx packets drops unsupported_rx unsupported_tx unmatched_rx unmatched_tx ambiguous_rx ambiguous_tx exited_rx exited_tx source status scope reason <"$work_dir/net.tsv"
-[[ $kind == M && $version == 3 && $iface == "$host_if" ]] || { echo "invalid metadata" >&2; exit 1; }
+[[ $kind == M && $version == 4 && $iface == "$host_if" ]] || { echo "invalid metadata" >&2; exit 1; }
 [[ $source == ebpf_cgroup && $status == ok && $scope == host_and_containers ]] || { echo "eBPF cgroup mode was not active: $source/$status/$scope $reason" >&2; exit 1; }
 [[ $packets -gt 0 ]] || { echo "no packets captured" >&2; exit 1; }
 [[ $drops -eq 0 ]] || { echo "capture dropped $drops packets" >&2; exit 1; }

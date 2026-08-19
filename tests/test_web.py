@@ -25,6 +25,10 @@ class WebContractTests(unittest.TestCase):
         self.assertIn("network_entities", WEB.HTML)
         self.assertIn('data-filter="host"', WEB.HTML)
         self.assertIn('data-filter="pod"', WEB.HTML)
+        self.assertIn('data-filter="container"', WEB.HTML)
+        self.assertIn("const containerized=Boolean(item.container||item.container_id||item.pod)", WEB.HTML)
+        self.assertIn("if(scopeFilter==='container')return item.containerized", WEB.HTML)
+        self.assertIn("entity.runtime||'container'", WEB.HTML)
         self.assertIn('class="copy"', WEB.HTML)
         self.assertIn("cache_age_ms", WEB.HTML)
 

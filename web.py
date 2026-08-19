@@ -87,7 +87,7 @@ HTML = r"""<!DOCTYPE html>
   <section><h2>活跃磁盘设备</h2><div class="diskwrap"><table><thead><tr><th class="left">设备</th><th>读/写</th>
     <th>读/写 IOPS</th><th>busy</th><th>读/写等待</th><th>队列深度</th></tr></thead><tbody id="diskrows"></tbody></table></div></section>
   <section><div class="sectionhead"><h2>进程与工作负载</h2><div class="segments" id="filters">
-    <button data-filter="all" class="active">全部</button><button data-filter="host">宿主</button><button data-filter="pod">Pod</button>
+    <button data-filter="all" class="active">全部</button><button data-filter="host">宿主</button><button data-filter="pod">Pod</button><button data-filter="container">容器</button>
   </div></div><div class="tablewrap"><table id="mainTable"><thead><tr>
     <th class="left" data-key="workload_label">范围 / 工作负载</th><th data-key="pid_sort">PID</th>
     <th data-key="cpu">CPU%</th><th data-key="rss_mb">内存</th><th data-key="read_kbs">读 IO</th>
@@ -104,15 +104,19 @@ const level=value=>number(value)>=90?'high':number(value)>=60?'mid':'low';
 function metric(label,value,detail,cls='',bar){const width=Math.max(0,Math.min(100,number(bar)));
   return `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${esc(cls)}">${esc(value)}</div>`+
     `<div class="detail">${esc(detail)}</div>${bar===undefined?'':`<div class="bar"><i style="width:${width}%"></i></div>`}</div>`}
-function workload(entity){if(entity.scope==='pod'||entity.kind==='container'){
-  const pod=[entity.namespace,entity.pod].filter(Boolean).join('/');return [pod,entity.container].filter(Boolean).join(' · ')||'Pod 容器'}return '宿主进程'}
+function workload(entity){if(entity.scope==='pod'){
+  const pod=[entity.namespace,entity.pod].filter(Boolean).join('/');return [pod,entity.container].filter(Boolean).join(' · ')||'Pod 容器'}
+  if(entity.scope==='container'){const name=entity.container||String(entity.container_id||'').slice(0,12)||'未命名';return [entity.runtime||'container',name].join(' · ')}
+  return '宿主进程'}
 function normalize(data){const processes=Array.isArray(data.processes)?data.processes:[];
-  const entities=Array.isArray(data.network_entities)?data.network_entities:[];return processes.concat(entities).map(item=>({
-    kind:item.kind||'process',scope:item.scope||'host',pid:item.pid??null,pid_sort:item.pid??-1,namespace:item.namespace||'',
+  const entities=Array.isArray(data.network_entities)?data.network_entities:[];return processes.concat(entities).map(item=>{const containerized=Boolean(item.container||item.container_id||item.pod);return {
+    kind:item.kind||'process',scope:item.scope||'host',containerized,runtime:item.runtime||'',pid:item.pid??null,pid_sort:item.pid??-1,namespace:item.namespace||'',
     pod:item.pod||'',container:item.container||'',container_id:item.container_id||'',attribution:item.attribution||'',
     cpu:number(item.cpu),rss_mb:number(item.rss_mb),read_kbs:number(item.read_kbs),write_kbs:number(item.write_kbs),
     net:number(item.net),recv_kbs:number(item.recv_kbs),sent_kbs:number(item.sent_kbs),user:item.user||'',cmd:item.cmd||'',
-    workload_label:workload(item)}))}
+    workload_label:workload(item)};})}
+function matchesScope(item){if(scopeFilter==='all')return true;if(scopeFilter==='host')return !item.containerized;
+  if(scopeFilter==='pod')return item.scope==='pod';if(scopeFilter==='container')return item.containerized;return true}
 function renderWarnings(data){const na=data.net_attribution||{}, warnings=[];
   if(data.privileged===0||data.privileged===false)warnings.push('当前非 root，进程、容器 IO 与网络归属可能不完整。');
   if(na.status&&na.status!=='ok')warnings.push('网络归属已降级：'+(na.reason||na.source||'采集器不可用'));
@@ -132,7 +136,7 @@ function hotspot(title,key,items){const rows=items.filter(item=>number(item[key]
   if(!rows.length)return '';return `<div class="hotbox"><div class="label">${esc(title)}</div>`+rows.map(item=>
     `<div class="hotitem"><div class="hotname"><strong>${esc(item.workload_label)}${item.pid?` · PID ${esc(item.pid)}`:''}</strong>`+
     `<span>${esc(item.cmd)}</span></div><b>${esc(size(item[key]))}/s</b></div>`).join('')+'</div>'}
-function renderRows(items){const visible=items.filter(item=>scopeFilter==='all'||(scopeFilter==='pod'?(item.scope==='pod'||item.kind==='container'):item.scope!=='pod'));
+function renderRows(items){const visible=items.filter(matchesScope);
   visible.sort((left,right)=>{const a=left[sortKey]??'',b=right[sortKey]??'';const result=typeof a==='number'&&typeof b==='number'?a-b:String(a).localeCompare(String(b));return(sortDesc?-1:1)*result});
   document.getElementById('rows').innerHTML=visible.slice(0,300).map(item=>{const bw=item.recv_kbs+item.sent_kbs;
     return `<tr><td class="left workload" title="${esc(item.workload_label)}">${esc(item.workload_label)}</td><td>${item.pid===null?'-':esc(item.pid)}</td>`+

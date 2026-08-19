@@ -33,6 +33,7 @@ type ProcessID struct {
 
 type Workload struct {
 	Scope       string
+	Runtime     string
 	CgroupID    uint64
 	CgroupPath  string
 	Namespace   string

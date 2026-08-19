@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/gopacket/gopacket/afpacket"
 )
 
@@ -22,6 +23,7 @@ type Config struct {
 	CgroupRoot    string
 	ContainerLogs string
 	PodLogs       string
+	Metadata      *RuntimeMetadataCache
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -51,6 +53,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.PodLogs != "" {
 		resolverConfig.PodLogs = cfg.PodLogs
+	}
+	if cfg.Metadata != nil {
+		resolverConfig.Metadata = cfg.Metadata
+	} else {
+		resolverConfig.Metadata = NewRuntimeMetadataCache(DefaultRuntimeMetadataConfig())
 	}
 	handle, err := afpacket.NewTPacket(
 		afpacket.OptInterface(cfg.Interface),
@@ -119,9 +126,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if bpfCollector != nil {
 			flows, readBPFErr := bpfCollector.ReadDeltas()
 			systemResolver, resolverErr := proc.LoadSystemResolver(resolverConfig)
-			if readBPFErr == nil && systemResolver != nil {
+			// Concurrent updates to the BPF hash can make one iteration
+			// incomplete. Keep the partial eBPF data (including container
+			// cgroup attribution) instead of discarding it and falling back to
+			// AF_PACKET, which cannot identify Pods or containers.
+			iterationPartial := errors.Is(readBPFErr, ebpf.ErrIterationAborted)
+			if systemResolver != nil && (readBPFErr == nil || iterationPartial) {
 				snapshot = SnapshotCgroupFlows(now, now.Sub(started), cfg.Interface, drops, window, systemResolver, flows, proc)
-				if resolverErr != nil {
+				if iterationPartial {
+					snapshot.Status = "partial"
+					snapshot.Reason = "eBPF 流量表在并发更新时本轮遍历未完成，已保留部分归属"
+				} else if resolverErr != nil {
 					snapshot.Status = "partial"
 					snapshot.Reason = fmt.Sprintf("部分 network namespace 无法读取: %v", resolverErr)
 				}
@@ -138,8 +153,8 @@ func Run(ctx context.Context, cfg Config) error {
 		} else {
 			snapshot = window.Snapshot(now, now.Sub(started), cfg.Interface, drops, proc)
 		}
-		if snapshot.Version < 3 {
-			snapshot.Version = 3
+		if snapshot.Version < 4 {
+			snapshot.Version = 4
 			snapshot.Source = "af_packet_fallback"
 			snapshot.Status = "partial"
 			snapshot.Scope = "host_network_namespace"

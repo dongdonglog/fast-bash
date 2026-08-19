@@ -25,10 +25,11 @@ jobs:
         run: go test ./...
       - name: Bash and Python checks
         run: |
-          bash -n smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh
-          shellcheck smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh
+          bash -n smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh tests/test_snapshot_v4.sh
+          shellcheck smon.sh install.sh tests/linux-root-integration.sh tests/linux-performance.sh tests/test_snapshot_v4.sh
           python3 -m py_compile web.py
           python3 -m unittest discover -s tests -p 'test_*.py'
+          tests/test_snapshot_v4.sh
       - name: Cross-build static collectors
         run: |
           mkdir -p build
@@ -41,6 +42,9 @@ jobs:
           bundle="$RUNNER_TEMP/smon-linux-amd64"
           install_dir="$RUNNER_TEMP/smon-bin"
           doc_dir="$RUNNER_TEMP/smon-doc"
+          pipe_install_dir="$RUNNER_TEMP/smon-pipe-bin"
+          pipe_doc_dir="$RUNNER_TEMP/smon-pipe-doc"
+          release_dir="$RUNNER_TEMP/smon-release"
           mkdir -p "$bundle"
           cp smon.sh "$bundle/smon"
           cp build/smon-net-amd64 "$bundle/smon-net"
@@ -50,3 +54,11 @@ jobs:
             SMON_BASE_URL="http://127.0.0.1:9" bash "$bundle/install.sh"
           "$install_dir/smon" -j | python3 -m json.tool >/dev/null
           python3 -c "import json,subprocess; d=json.loads(subprocess.check_output(['$install_dir/smon','-j'])); assert d['net_attribution']['status'] in ('ok','partial')"
+
+          mkdir -p "$release_dir"
+          tar -C "$RUNNER_TEMP" -czf "$release_dir/smon-linux-amd64.tar.gz" smon-linux-amd64
+          (cd "$release_dir" && sha256sum smon-linux-amd64.tar.gz > smon-linux-amd64.tar.gz.sha256)
+          cat install.sh | sudo env INSTALL_DIR="$pipe_install_dir" SMON_DOC_DIR="$pipe_doc_dir" \
+            SMON_BASE_URL="file://$release_dir" bash
+          "$pipe_install_dir/smon-net" --version
+          "$pipe_install_dir/smon" -j | python3 -m json.tool >/dev/null

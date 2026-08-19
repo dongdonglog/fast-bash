@@ -56,3 +56,30 @@ func TestWriteSnapshotV3IncludesWorkloads(t *testing.T) {
 		t.Fatalf("unexpected v3 snapshot:\n%s", text)
 	}
 }
+
+func TestWriteSnapshotV4IncludesRuntimeAndMetadataWorkloads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "net.tsv")
+	err := WriteSnapshot(path, Snapshot{
+		Version: 4, UnixMilli: 123, IntervalMS: 1000, Interface: "eth0", Source: "ebpf_cgroup", Status: "ok", Scope: "host_and_containers",
+		Processes: []ProcessRate{{ProcessID: ProcessID{PID: 5, StartTicks: 50}, RXKBS: 4, TXKBS: 6, Workload: Workload{Scope: "pod", Runtime: "cri-o", Namespace: "ns", Pod: "pod", Container: "app", ContainerID: "abc", Attribution: "socket"}}},
+		Entities:  []EntityRate{{Workload: Workload{CgroupID: 99, Scope: "container", Runtime: "docker", Container: "api", ContainerID: "def", Attribution: "cgroup"}, RXKBS: 7, TXKBS: 8}},
+		Workloads: []Workload{{CgroupID: 99, Scope: "container", Runtime: "docker", Container: "api", ContainerID: "def", CgroupPath: "/system.slice/docker-def.scope", Attribution: "cgroup"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for _, want := range []string{
+		"P\t5\t50\t4\t6\tpod\tcri-o\tns\tpod\tapp\tabc\tsocket\n",
+		"C\t99\tcontainer\tdocker\t-\t-\tapi\tdef\t7\t8\tcgroup\n",
+		"W\t99\tcontainer\tdocker\t-\t-\tapi\tdef\t/system.slice/docker-def.scope\tcgroup\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("v4 snapshot missing %q:\n%s", want, text)
+		}
+	}
+}

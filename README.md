@@ -7,13 +7,13 @@
 [![Release](https://img.shields.io/github/v/release/dongdonglog/fast-bash)](https://github.com/dongdonglog/fast-bash/releases/latest)
 [![Release assets](https://img.shields.io/github/downloads/dongdonglog/fast-bash/total)](https://github.com/dongdonglog/fast-bash/releases)
 
-> 一条命令看到 CPU、内存、磁盘 IO、网卡流量，以及**宿主机进程 + K3s Pod/容器** 的 TCP/UDP 收发速率和定位到 PID 的归属结论。
+> 一条命令看到 CPU、内存、磁盘 IO、网卡流量，以及**宿主机进程 + Kubernetes Pod + Docker/Podman 容器** 的 TCP/UDP 收发速率和定位到 PID 的归属结论。
 
 `smon` 是一个面向 Linux 服务器的实时排障工具，专为回答这些问题而设计：
 
 - *这个口子到底是谁打的？落到哪个 Pod？*
 - *CPU/内存没炸，但磁盘 IO 在抖，是哪条容器写爆了？*
-- *网卡流量起来了，宿主进程和 K3s 容器各自的贡献是多少？*
+- *网卡流量起来了，宿主进程、Kubernetes Pod 和独立容器各自的贡献是多少？*
 - *内存里 991 个僵尸进程，源头是哪个父进程？*
 
 **采集器** 用 Go 写的 `smon-net`（嵌 eBPF cgroup + `AF_PACKET/TPACKET_V3`，MIT），**呈现层** 用 Bash TUI 和纯 Python 3 标准库的 HTTP 面板；不需要 Node、不需要 React、不需要 Go runtime。Linux amd64 / arm64 静态发行包。
@@ -29,7 +29,7 @@
 </details>
 
 <details>
-<summary><b>Web 面板 · 进程与工作负载列表（全部 / 宿主 / Pod 筛选）</b></summary>
+<summary><b>Web 面板 · 进程与工作负载列表（全部 / 宿主 / Pod / 容器筛选）</b></summary>
 
 ![smon Web 面板 - 进程与工作负载](docs/images/smon-web-processes.png)
 </details>
@@ -62,7 +62,7 @@
 - **三层呈现** — Bash TUI、JSON (`-j`)、Web 面板，三者消费同一份版本化的原子 TSV 快照。
 - **IPv4 / IPv6 / VLAN / QinQ** 全覆盖，unknown 分类（未匹配、shared socket、已退出、非 TCP/UDP）透明可见。
 - **静态离线发行包** — runtime 不需要 Go / Node / NetHogs / libpcap / ncurses；只依赖系统自带的 Python 3。
-- **K3s / 任意 cgroup v2** 场景开箱即用，不需要 Kubernetes API 凭据，也不调用运行时命令。
+- **主流 CRI/runtime** — 通过本机 CRI v1 统一支持 containerd、CRI-O、cri-dockerd，并识别 Docker、Podman/libpod 的 systemd 与 cgroupfs 布局；不需要 Kubernetes API 凭据，也不调用运行时命令。
 
 ---
 
@@ -168,7 +168,7 @@ sudo SMON_NETIF=eno1 smon --serve 8080
 
 - **顶部指标卡** — CPU、内存、根分区、网卡总 RX/TX、对象数（含对象/Zombie 计数）。
 - **诊断结论** — 责任 PID/Pod、证据、根因、可复制的只读排查命令（一键复制）。
-- **网络热点** — 接收/发送最快的 5 个宿主进程或容器工作负载，以及顶层块设备指标；支持 `全部 / 宿主 / Pod` 筛选；无有效网络流量时整区隐藏。
+- **网络热点** — 接收/发送最快的 5 个宿主进程或容器工作负载，以及顶层块设备指标；支持 `全部 / 宿主 / Pod / 容器` 筛选；无有效网络流量时整区隐藏。
 - **活跃磁盘设备** — `sda / dm-0` 等设备的读写吞吐、IOPS、busy、读写 await、队列深度。
 - **进程与工作负载** — 全量进程列表，附归属类型（socket / cgroup / 已退出 / unknown）。
 
@@ -190,10 +190,12 @@ Python 后端长期运行一个 `smon-net` 实例、每秒更新一次内存缓�
 
 1. 嵌入的 **cgroup-skb eBPF 程序** 按 cgroup ID、IPv4/IPv6、TCP/UDP tuple 和方向累计字节。
 2. `AF_PACKET/TPACKET_V3` 同时给出选定网卡的总量、报文数和 drop；eBPF 加载失败自动回退。
+   eBPF 流量 map 在高并发更新时可能出现 `iteration aborted`（遍历期间条目被新增或淘汰）；采集器会自动重试，仍未完成时保留已读归属并标记本轮 `partial`，不会因此丢掉 Pod/容器维度或直接降级。
 3. 扫描所有进程的 **cgroup、network namespace、socket fd** 与对应的 `/proc/<pid>/net/*`，把唯一 socket owner 关联回 PID。
-4. 从 `cri-containerd-*.scope`、`/var/log/containers`、`/var/log/pods` 解析 namespace / Pod / container；**不调用 Kubernetes API**，也不调 `kubectl` / `crictl`。
-5. 唯一 owner → PID；共享 socket / 短连接 / 多进程容器 → 归到真实 Pod/容器汇总；拿不到 cgroup 元数据 → `unknown`。
-6. Bash TUI / JSON / Python Web 都消费同一份 **版本化的 v3 原子 TSV 快照**。
+4. 只读探测本机 CRI v1 socket，缓存 containerd、CRI-O、cri-dockerd 的容器与 Pod metadata；同时解析 `cri-containerd-*`、`crio-*`、`docker-*`、`libpod-*`、cgroupfs 路径和标准 Pod 日志名。
+5. CRI metadata 不可用时，从 Docker `config.v2.json`、CRI-O/Podman OCI annotations 回退；仍拿不到名称时保留真实 runtime 和容器 ID，不编造 Pod/PID。
+6. 唯一 owner → PID；共享 socket / 短连接 / 多进程容器 → 归到真实 Pod/容器汇总；拿不到 cgroup 元数据 → `unknown`。
+7. Bash TUI / JSON / Python Web 都消费同一份 **版本化的 v4 原子 TSV 快照**。
 
 明确不猜测 PID 的场景（落入 `unknown`）：
 
@@ -243,6 +245,7 @@ Python 后端长期运行一个 `smon-net` 实例、每秒更新一次内存缓�
       "recv_kbs": 8100,
       "sent_kbs": 980,
       "scope": "pod",
+      "runtime": "containerd",
       "namespace": "moying-business",
       "pod": "scene-hub-service-54dbcb7cb8-6wkpr",
       "container": "scene-hub-service",
@@ -254,6 +257,8 @@ Python 后端长期运行一个 `smon-net` 实例、每秒更新一次内存缓�
     {
       "kind": "container",
       "pid": null,
+      "scope": "pod",
+      "runtime": "containerd",
       "namespace": "moying-business",
       "pod": "scene-hub-service-54dbcb7cb8-6wkpr",
       "container": "scene-hub-service",
@@ -270,7 +275,7 @@ Python 后端长期运行一个 `smon-net` 实例、每秒更新一次内存缓�
       "summary": "设备 sda 出现写等待，主要责任 Pod 为 ...",
       "evidence": ["busy 91%", "write await 42ms"],
       "suspects": [{ "kind": "pod", "namespace": "moying-business", "pod": "..." }],
-      "actions": [{ "label": "查看 Pod", "command": "k3s kubectl -n moying-business get pod ... -o wide" }]
+      "actions": [{ "label": "查看 Pod", "command": "kubectl -n moying-business get pod ... -o wide" }]
     }
   ]
 }
@@ -305,12 +310,13 @@ smon -j | python3 -m json.tool
 smon-net --interface eno1 --interval 1s --output /run/smon/net.tsv [--once]
 ```
 
-快照权限 `0600`，通过同目录临时文件 + `fsync` + rename 原子替换。格式版本 **v3**（Bash 同时兼容旧的 v1 / v2）：
+快照权限 `0600`，通过同目录临时文件 + `fsync` + rename 原子替换。格式版本 **v4**（Bash 同时兼容旧的 v1 / v2 / v3）：
 
 ```text
-M<TAB>3<TAB>unix_ms<TAB>interval_ms<TAB>iface<TAB>captured_rx_kbs<TAB>captured_tx_kbs<TAB>unknown_rx_kbs<TAB>unknown_tx_kbs<TAB>packets<TAB>drops<TAB>unsupported_rx_kbs<TAB>unsupported_tx_kbs<TAB>unmatched_rx_kbs<TAB>unmatched_tx_kbs<TAB>ambiguous_rx_kbs<TAB>ambiguous_tx_kbs<TAB>exited_rx_kbs<TAB>exited_tx_kbs<TAB>source<TAB>status<TAB>scope<TAB>reason
-P<TAB>pid<TAB>start_ticks<TAB>recv_kbs<TAB>sent_kbs<TAB>scope<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>attribution
-C<TAB>cgroup_id<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>recv_kbs<TAB>sent_kbs<TAB>attribution
+M<TAB>4<TAB>unix_ms<TAB>interval_ms<TAB>iface<TAB>captured_rx_kbs<TAB>captured_tx_kbs<TAB>unknown_rx_kbs<TAB>unknown_tx_kbs<TAB>packets<TAB>drops<TAB>unsupported_rx_kbs<TAB>unsupported_tx_kbs<TAB>unmatched_rx_kbs<TAB>unmatched_tx_kbs<TAB>ambiguous_rx_kbs<TAB>ambiguous_tx_kbs<TAB>exited_rx_kbs<TAB>exited_tx_kbs<TAB>source<TAB>status<TAB>scope<TAB>reason
+P<TAB>pid<TAB>start_ticks<TAB>recv_kbs<TAB>sent_kbs<TAB>scope<TAB>runtime<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>attribution
+C<TAB>cgroup_id<TAB>scope<TAB>runtime<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>recv_kbs<TAB>sent_kbs<TAB>attribution
+W<TAB>cgroup_id<TAB>scope<TAB>runtime<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>cgroup_path<TAB>attribution
 ```
 
 ---
@@ -319,11 +325,15 @@ C<TAB>cgroup_id<TAB>namespace<TAB>pod<TAB>container<TAB>container_id<TAB>recv_kb
 
 | 平台 | 能力 |
 |------|------|
-| Linux 5.15+ · cgroup v2 · amd64 / arm64 · root | 宿主进程 + K3s Pod/容器 IPv4/IPv6 TCP/UDP；eBPF 加载失败自动回退 |
+| Linux 5.15+ · cgroup v2 · amd64 / arm64 · root | 宿主进程 + Kubernetes/CRI Pod + Docker/Podman 容器 IPv4/IPv6 TCP/UDP；eBPF 加载失败自动回退 |
 | Linux · 非 root / 无 `CAP_NET_RAW` | 自动降级为部分 TCP（`ss -i`） |
 | macOS | CPU / 内存 / 系统概况；进程磁盘与网络不可用，需 root 跑完整 Linux |
 
-完整模式覆盖宿主机 cgroup v2 下的 Pod/容器；唯一 socket owner 才显示 PID，多进程共享 socket 显示容器汇总。纯转发和缺 cgroup 元数据的流量保留 unknown，**不会错误记到 `k3s server`**。
+已验证的 runtime/cgroup 组合包括 containerd、CRI-O、Docker/cri-dockerd、Podman/libpod 的 systemd 与 cgroupfs 布局，并覆盖 rootless Docker/Podman metadata。默认探测标准 Kubernetes、K3s/RKE2、k0s、MicroK8s 的常见 CRI socket，发行版不限定为 K3s。可通过 `SMON_CRI_ENDPOINTS=/path/a.sock,/path/b.sock` 覆盖默认列表。私有或未来 runtime 只要实现 CRI v1 且容器 ID 能对应 cgroup，仍可读取标准 metadata；非标准且没有可读 metadata 的实现只能显示可确认的 runtime/容器 ID，无法承诺未知私有格式的名称解析。
+
+唯一 socket owner 才显示 PID，多进程共享 socket 显示容器汇总。纯转发和缺 cgroup 元数据的流量保留 unknown，**不会错误记到 `k3s server` 或 `dockerd`**。
+
+这里的 **Pod** 是 Kubernetes 的调度/工作负载单位，一个 Pod 可以包含一个或多个容器；**容器** 是 runtime 实际运行的进程隔离单位。API 中 `scope: "pod"` 表示该进程或容器已经解析到 Pod metadata，并不表示“只有 Pod、没有容器”。Web 的“容器”筛选会包含 Pod 内容器以及独立的 Docker/Podman 容器；“Pod”筛选只显示已解析到 Pod 的对象。
 
 项目不会自动给 `smon-net` 设置 capabilities；希望完整采集请直接 `sudo smon`。
 
@@ -349,8 +359,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/smon-net-arm64 ./cmd/smon
 
 - IPv4 / IPv6 · VLAN · TCP / UDP
 - 跨 netns 的 `/proc` 映射
+- CRI v1、Docker、CRI-O、Podman 元数据 · systemd/cgroupfs 路径
 - Pod 元数据 · 共享 socket · 容器级 fallback
-- `unknown` 分类 · PID 复用 · 快照 v3 兼容性
+- `unknown` 分类 · PID 复用 · 快照 v1-v4 兼容性
 
 Linux root 集成测试：`tests/linux-root-integration.sh`。
 
@@ -394,7 +405,7 @@ fast-bash/
 欢迎 issue 与 PR。建议先开 issue 同步设计意图，再提代码。
 
 - **Bug 报告** — 带上 `smon --version`、`uname -a`、问题现象和最小复现步骤；Web 相关问题附浏览器版本。
-- **新指标 / 新接口** — 先讨论监控目标和 JSON 字段兼容性策略，避免破坏 v3 快照格式。
+- **新指标 / 新接口** — 先讨论监控目标和 JSON 字段兼容性策略，避免破坏 v4 快照格式。
 - **PR** — 保持 Go 模块、Shell 脚本、Python 各自保持原有风格；新功能请附带测试用例。
 
 ---

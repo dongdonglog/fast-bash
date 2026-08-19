@@ -5,8 +5,12 @@ set -euo pipefail
 
 BASE_URL="${SMON_BASE_URL:-https://github.com/dongdonglog/fast-bash/releases/latest/download}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
-if ! SCRIPT_DIR=$(cd "$SCRIPT_DIR" 2>/dev/null && pwd); then SCRIPT_DIR=$(pwd); fi
+SCRIPT_SOURCE=${BASH_SOURCE[0]-}
+SCRIPT_DIR=""
+if [[ -n $SCRIPT_SOURCE ]]; then
+  SCRIPT_DIR=$(dirname "$SCRIPT_SOURCE")
+  if ! SCRIPT_DIR=$(cd "$SCRIPT_DIR" 2>/dev/null && pwd); then SCRIPT_DIR=""; fi
+fi
 WORK_DIR=""
 
 cleanup() {
@@ -41,10 +45,17 @@ fetch() {  # $1=url $2=dest
 }
 
 SOURCE_DIR=$SCRIPT_DIR
-SMON_SOURCE="$SOURCE_DIR/smon"
-[[ -f $SMON_SOURCE ]] || SMON_SOURCE="$SOURCE_DIR/smon.sh"
-if [[ ! -f $SMON_SOURCE || ! -x $SOURCE_DIR/smon-net || ! -f $SOURCE_DIR/web.py || \
-      ! -f $SOURCE_DIR/LICENSE || ! -f $SOURCE_DIR/THIRD_PARTY_NOTICES ]]; then
+SMON_SOURCE=""
+LOCAL_ASSETS_COMPLETE=false
+if [[ -n $SOURCE_DIR ]]; then
+  SMON_SOURCE="$SOURCE_DIR/smon"
+  [[ -f $SMON_SOURCE ]] || SMON_SOURCE="$SOURCE_DIR/smon.sh"
+  if [[ -f $SMON_SOURCE && -x $SOURCE_DIR/smon-net && -f $SOURCE_DIR/web.py && \
+        -f $SOURCE_DIR/LICENSE && -f $SOURCE_DIR/THIRD_PARTY_NOTICES ]]; then
+    LOCAL_ASSETS_COMPLETE=true
+  fi
+fi
+if [[ $LOCAL_ASSETS_COMPLETE != true ]]; then
   WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/smon-install.XXXXXX")
   ARCHIVE="smon-linux-$ARCH.tar.gz"
   echo "本地资产不完整，下载 $ARCHIVE ..."

@@ -13,10 +13,19 @@ import (
 )
 
 var (
-	containerScopePattern = regexp.MustCompile(`(?:^|/)cri-containerd-([0-9a-f]{12,64})\.scope(?:/|$)`)
+	containerScopePattern = regexp.MustCompile(`(?:^|/)(cri-containerd|crio|docker|libpod)-([0-9a-f]{12,64})\.scope(?:/|$)`)
 	podSlicePattern       = regexp.MustCompile(`(?:^|/)kubepods[^/]*/kubepods[^/]*-pod([0-9a-fA-F_]+)\.slice(?:/|$)`)
+	podCgroupPattern      = regexp.MustCompile(`(?:^|/)pod([0-9a-fA-F_-]{16,})(?:/|$)`)
 	containerLogPattern   = regexp.MustCompile(`^(.+)_([^_]+)_(.+)-([0-9a-f]{12,64})\.log$`)
+	containerIDPattern    = regexp.MustCompile(`^[0-9a-f]{12,64}$`)
 )
+
+type ContainerCgroup struct {
+	Runtime     string
+	ContainerID string
+	PodUID      string
+	RootPath    string
+}
 
 type ProcessOwner struct {
 	ProcessID
@@ -45,6 +54,7 @@ type ResolverConfig struct {
 	CgroupRoot    string
 	ContainerLogs string
 	PodLogs       string
+	Metadata      *RuntimeMetadataCache
 }
 
 func DefaultResolverConfig() ResolverConfig {
@@ -55,16 +65,50 @@ func DefaultResolverConfig() ResolverConfig {
 	}
 }
 
-func ParseContainerCgroup(path string) (containerID, podUID string, ok bool) {
+func ParseContainerCgroupInfo(path string) (ContainerCgroup, bool) {
+	path = filepath.Clean(path)
+	var result ContainerCgroup
 	containerMatch := containerScopePattern.FindStringSubmatch(path)
-	if len(containerMatch) != 2 {
-		return "", "", false
+	if len(containerMatch) == 3 {
+		result.Runtime = map[string]string{"cri-containerd": "containerd", "crio": "cri-o", "docker": "docker", "libpod": "podman"}[containerMatch[1]]
+		result.ContainerID = containerMatch[2]
+	} else {
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		for index := 0; index+1 < len(parts); index++ {
+			if (parts[index] == "docker" || parts[index] == "libpod") && containerIDPattern.MatchString(parts[index+1]) {
+				result.Runtime = map[string]string{"docker": "docker", "libpod": "podman"}[parts[index]]
+				result.ContainerID = parts[index+1]
+				break
+			}
+		}
+		if result.ContainerID == "" && strings.Contains(path, "kubepods") {
+			for _, part := range parts {
+				if containerIDPattern.MatchString(part) {
+					result.Runtime, result.ContainerID = "cri", part
+				}
+			}
+		}
+		if result.ContainerID == "" {
+			return ContainerCgroup{}, false
+		}
 	}
+	result.RootPath = containerRootPath(path, result.ContainerID)
 	podMatch := podSlicePattern.FindStringSubmatch(path)
 	if len(podMatch) == 2 {
-		podUID = strings.ToLower(strings.ReplaceAll(podMatch[1], "_", "-"))
+		result.PodUID = normalizePodUID(podMatch[1])
+	} else if podMatch = podCgroupPattern.FindStringSubmatch(path); len(podMatch) == 2 {
+		result.PodUID = normalizePodUID(podMatch[1])
 	}
-	return containerMatch[1], podUID, true
+	return result, true
+}
+
+func ParseContainerCgroup(path string) (containerID, podUID string, ok bool) {
+	info, ok := ParseContainerCgroupInfo(path)
+	return info.ContainerID, info.PodUID, ok
+}
+
+func normalizePodUID(value string) string {
+	return strings.ToLower(strings.ReplaceAll(value, "_", "-"))
 }
 
 func ParseContainerLogName(name string) (Workload, bool) {
@@ -88,6 +132,10 @@ func (p ProcFS) LoadSystemResolver(cfg ResolverConfig) (*SystemResolver, error) 
 	}
 	logs := loadContainerLogs(cfg.ContainerLogs)
 	pods := loadPodLogs(cfg.PodLogs)
+	var catalog WorkloadCatalog
+	if cfg.Metadata != nil {
+		catalog = cfg.Metadata.Catalog()
+	}
 	dirs, err := os.ReadDir(p.Root)
 	if err != nil {
 		return nil, err
@@ -124,7 +172,7 @@ func (p ProcFS) LoadSystemResolver(cfg ResolverConfig) (*SystemResolver, error) 
 		if err != nil {
 			continue
 		}
-		workload := workloadForPath(cgroupID, cgroupPath, logs, pods)
+		workload := workloadForPath(cgroupID, cgroupPath, logs, pods, catalog)
 		workloads[cgroupID] = workload
 		process := ProcessID{PID: pid, StartTicks: start}
 		owner := ProcessOwner{ProcessID: process, CgroupID: cgroupID, NetNS: netns, Workload: workload}
@@ -192,6 +240,19 @@ func (r *SystemResolver) Resolve(sample CgroupFlow) Resolution {
 		return Resolution{Workload: &workload, Reason: reason}
 	}
 	return Resolution{Reason: reason}
+}
+
+func (r *SystemResolver) Workloads() []Workload {
+	if r == nil {
+		return nil
+	}
+	containers := make(map[uint64]Workload)
+	for id, workload := range r.workload {
+		if workload.IsContainer() {
+			containers[id] = workload
+		}
+	}
+	return sortedWorkloads(containers)
 }
 
 func (p ProcFS) loadPIDSocketTables(pid int) ([]SocketEntry, error) {
@@ -300,25 +361,88 @@ func loadPodLogs(root string) map[string]Workload {
 	return result
 }
 
-func workloadForPath(id uint64, path string, logs []Workload, pods map[string]Workload) Workload {
+func workloadForPath(id uint64, path string, logs []Workload, pods map[string]Workload, catalog WorkloadCatalog) Workload {
 	result := Workload{Scope: "host", CgroupID: id, CgroupPath: path, Attribution: "socket"}
-	containerID, podUID, ok := ParseContainerCgroup(path)
+	info, ok := ParseContainerCgroupInfo(path)
 	if !ok {
-		return result
+		candidate := containerIDFromCatalogPath(path, catalog)
+		metadata, exists := catalog.Lookup(candidate)
+		if !exists {
+			return result
+		}
+		info = ContainerCgroup{Runtime: metadata.Runtime, ContainerID: candidate, RootPath: containerRootPath(path, candidate)}
 	}
-	result.Scope = "pod"
-	result.ContainerID = containerID
+	result.Scope = "container"
+	result.Runtime = info.Runtime
+	result.ContainerID = info.ContainerID
+	if info.RootPath != "" {
+		result.CgroupPath = info.RootPath
+	}
 	result.Attribution = "cgroup"
-	if pod, exists := pods[podUID]; exists {
+	if info.PodUID != "" {
+		result.Scope = "pod"
+	}
+	if metadata, exists := catalog.Lookup(info.ContainerID); exists {
+		mergeWorkload(&result, metadata)
+	}
+	if pod, exists := pods[info.PodUID]; exists {
 		result.Namespace, result.Pod = pod.Namespace, pod.Pod
+		result.Scope = "pod"
 	}
 	for _, log := range logs {
-		if strings.HasPrefix(containerID, log.ContainerID) || strings.HasPrefix(log.ContainerID, containerID) {
+		if strings.HasPrefix(info.ContainerID, log.ContainerID) || strings.HasPrefix(log.ContainerID, info.ContainerID) {
 			result.Namespace, result.Pod, result.Container = log.Namespace, log.Pod, log.Container
+			result.Scope = "pod"
 			break
 		}
 	}
 	return result
+}
+
+func containerIDFromCatalogPath(path string, catalog WorkloadCatalog) string {
+	for _, part := range strings.Split(strings.Trim(filepath.Clean(path), "/"), "/") {
+		candidate := strings.TrimSuffix(part, ".scope")
+		for _, prefix := range []string{"cri-containerd-", "containerd-", "crio-", "docker-", "libpod-"} {
+			candidate = strings.TrimPrefix(candidate, prefix)
+		}
+		if containerIDPattern.MatchString(candidate) {
+			if _, ok := catalog.Lookup(candidate); ok {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func containerRootPath(path, containerID string) string {
+	parts := strings.Split(strings.Trim(filepath.Clean(path), "/"), "/")
+	for index, part := range parts {
+		if part == containerID || strings.Contains(part, containerID) {
+			return "/" + strings.Join(parts[:index+1], "/")
+		}
+	}
+	return filepath.Clean(path)
+}
+
+func mergeWorkload(target *Workload, source Workload) {
+	if source.Scope == "pod" || (source.Scope != "" && target.Scope != "pod") {
+		target.Scope = source.Scope
+	}
+	if source.Runtime != "" && source.Runtime != "cri" {
+		target.Runtime = source.Runtime
+	}
+	if source.Namespace != "" {
+		target.Namespace = source.Namespace
+	}
+	if source.Pod != "" {
+		target.Pod = source.Pod
+	}
+	if source.Container != "" {
+		target.Container = source.Container
+	}
+	if source.ContainerID != "" {
+		target.ContainerID = source.ContainerID
+	}
 }
 
 func appendUniqueProcess(items []ProcessID, process ProcessID) []ProcessID {

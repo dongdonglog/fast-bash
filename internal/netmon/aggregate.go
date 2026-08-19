@@ -144,6 +144,7 @@ type Snapshot struct {
 	ExitedTXKBS      uint64
 	Processes        []ProcessRate
 	Entities         []EntityRate
+	Workloads        []Workload
 	Source           string
 	Status           string
 	Scope            string
@@ -201,9 +202,10 @@ func SnapshotCgroupFlows(now time.Time, elapsed time.Duration, iface string, dro
 	}
 
 	snapshot := Snapshot{
-		Version: 3, UnixMilli: now.UnixMilli(), IntervalMS: elapsed.Milliseconds(), Interface: iface,
+		Version: 4, UnixMilli: now.UnixMilli(), IntervalMS: elapsed.Milliseconds(), Interface: iface,
 		Packets: capture.Packets, Drops: drops, Source: "ebpf_cgroup", Status: "ok", Scope: "host_and_containers",
 	}
+	snapshot.Workloads = resolver.Workloads()
 	for id, item := range processes {
 		start, err := starts.StartTime(id.PID)
 		if err != nil || start != id.StartTicks {

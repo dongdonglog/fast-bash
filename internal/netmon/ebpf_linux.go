@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"runtime"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -77,6 +78,45 @@ func OpenEBPFCollector(cgroupRoot string) (*EBPFCollector, error) {
 }
 
 func (c *EBPFCollector) ReadDeltas() ([]CgroupFlow, error) {
+	// Hash maps are updated by the cgroup programs while they are being
+	// iterated. cilium/ebpf reports ErrIterationAborted when a concurrent
+	// update prevents a complete walk. Retry first; if traffic is continuous,
+	// keep the partial walk and let the caller publish a partial eBPF snapshot
+	// instead of throwing away all container attribution.
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, current, err := c.readDeltasOnce()
+		if err == nil {
+			c.previous = current
+			return result, nil
+		}
+		if !errors.Is(err, ebpf.ErrIterationAborted) {
+			return nil, err
+		}
+		lastErr = err
+		runtime.Gosched()
+	}
+
+	// A final partial walk is still useful. Updating the baselines for keys
+	// that were observed prevents them from being counted twice next cycle;
+	// keys not observed remain at their prior baseline and will be caught up
+	// by a later complete walk.
+	result, current, err := c.readDeltasOnce()
+	if err == nil {
+		c.previous = current
+		return result, nil
+	}
+	if errors.Is(err, ebpf.ErrIterationAborted) {
+		for key, value := range current {
+			c.previous[key] = value
+		}
+		return result, lastErr
+	}
+	return nil, err
+}
+
+func (c *EBPFCollector) readDeltasOnce() ([]CgroupFlow, map[bpfFlowKey]uint64, error) {
 	iterator := c.flows.Iterate()
 	current := make(map[bpfFlowKey]uint64)
 	var key bpfFlowKey
@@ -85,21 +125,22 @@ func (c *EBPFCollector) ReadDeltas() ([]CgroupFlow, error) {
 	for iterator.Next(&key, &value) {
 		current[key] = value
 		previous := c.previous[key]
-		if value <= previous {
+		if value == previous {
 			continue
 		}
 		flow, ok := flowFromBPFKey(key)
 		if !ok {
 			continue
 		}
+		// LRU eviction can recreate a key with a smaller counter. Treat it as
+		// a fresh counter rather than waiting for it to exceed the old value.
+		if value < previous {
+			previous = 0
+		}
 		flow.Bytes = value - previous
 		result = append(result, flow)
 	}
-	if err := iterator.Err(); err != nil {
-		return nil, err
-	}
-	c.previous = current
-	return result, nil
+	return result, current, iterator.Err()
 }
 
 func (c *EBPFCollector) Close() {
