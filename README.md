@@ -71,8 +71,8 @@
 完整模式需要 `root`（或具备 `CAP_BPF + CAP_NET_RAW` 权限）：
 
 ```bash
-# 1. 在线安装（自动识别 amd64 / arm64，校验 SHA-256）
-curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
+# 1. 在线安装最新版 Release（自动识别 amd64 / arm64，校验 SHA-256）
+curl -fsSL https://github.com/dongdonglog/fast-bash/releases/latest/download/install.sh | sudo bash
 
 # 2. 打开交互式 TUI
 sudo smon
@@ -87,7 +87,19 @@ sudo smon --serve 8080
 ### 在线安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dongdonglog/fast-bash/main/install.sh | sudo bash
+curl -fsSL https://github.com/dongdonglog/fast-bash/releases/latest/download/install.sh | sudo bash
+```
+
+直接下载离线包：
+
+```bash
+# Linux x86_64 / amd64
+curl -fLO https://github.com/dongdonglog/fast-bash/releases/latest/download/smon-linux-amd64.tar.gz
+curl -fLO https://github.com/dongdonglog/fast-bash/releases/latest/download/smon-linux-amd64.tar.gz.sha256
+
+# Linux ARM64
+curl -fLO https://github.com/dongdonglog/fast-bash/releases/latest/download/smon-linux-arm64.tar.gz
+curl -fLO https://github.com/dongdonglog/fast-bash/releases/latest/download/smon-linux-arm64.tar.gz.sha256
 ```
 
 内网可指向镜像：
